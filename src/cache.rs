@@ -1,31 +1,35 @@
-use candle_core::{Device, Tensor};
+use candle_core::Tensor;
 use lru::LruCache;
-use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
-const CACHE_CAPACITY: usize = 4;
-pub static GLOBAL_CACHE: Lazy<TensorCache> = Lazy::new(|| TensorCache::new(CACHE_CAPACITY));
+use crate::STFile;
 
-pub struct TensorCache {
-    cache: Mutex<LruCache<String, Arc<Tensor>>>,
+pub struct Cache<T> {
+    cache: Mutex<LruCache<String, Arc<T>>>,
 }
 
-impl TensorCache {
+impl<T> Cache<T> {
     pub fn new(capacity: usize) -> Self {
-        TensorCache {
+        Cache {
             cache: Mutex::new(LruCache::new(NonZeroUsize::new(capacity).unwrap())),
         }
     }
 
-    pub fn get(&self, key: &str) -> Option<Arc<Tensor>> {
+    pub fn get(&self, key: &str) -> Option<Arc<T>> {
         let mut cache = self.cache.lock().unwrap();
         cache.get(key).cloned()
     }
 
-    pub fn insert(&self, key: String, tensor: Tensor) {
-        let tensor = Arc::new(tensor);
+    pub fn insert(&self, key: String, value: T) {
+        let value = Arc::new(value);
         let mut cache = self.cache.lock().unwrap();
-        cache.put(key, tensor);
+        cache.put(key, value);
     }
 }
+
+pub type TensorCache = Cache<Tensor>;
+pub type ContextCache = Cache<HashMap<String, Tensor>>;
+pub type STFileCache = Cache<STFile>;
+
