@@ -1,6 +1,5 @@
-use cache::{ContextCache, STFileCache, TensorCache};
-use candle_core::cuda::cudarc::driver::sys::Lib;
-use candle_core::{safetensors as sf, DType, Device, DeviceLocation, Error, Tensor};
+use cache::Cache;
+use candle_core::{safetensors as sf, DType, Device, DeviceLocation, Tensor};
 use memmap2::Mmap;
 use once_cell::sync::Lazy;
 use safetensors::tensor::SafeTensorError;
@@ -11,9 +10,10 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
-use thiserror::Error;
 //mod config;
 mod cache;
+mod op;
+mod mem;
 
 const MAX_BLOCK_SIZE: usize = 128 * 1024;
 const MAX_PAGES: usize = 4;
@@ -24,14 +24,60 @@ const TENSOR_CACHE_CAPACITY: usize = 4;
 const CONTEXT_CACHE_CAPACITY: usize = 100; //TODO: review this
 const STFILE_CACHE_CAPACITY: usize = 100; //TODO: review this
 
+pub type TensorCache = Cache<String, Tensor>;
+pub type ContextCache = Cache<String, HashMap<String, Tensor>>;
+pub type STFileCache = Cache<String, FastTensorFile>;
+
+#[derive(thiserror::Error, Debug)]
+pub enum FastTensorsError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("SafeTensors error: {0}")]
+    SafeTensors(#[from] SafeTensorError),
+    #[error("Candle error: {0}")]
+    Candle(#[from] candle_core::Error),
+    #[error("Invalid data: {0}")]
+    InvalidData(String),
+    #[error("Slice conversion error: {0}")]
+    Conversion(#[from] std::array::TryFromSliceError),
+    #[error("Unknown dtype: {0}")]
+    UnknownDtype(String),
+}
+
+
+impl From<FastTensorsError> for candle_core::Error {
+    fn from(error: FastTensorsError) -> Self {
+        match error {
+            FastTensorsError::Io(e) => candle_core::Error::Io(e),
+            FastTensorsError::Json(e) => {
+                candle_core::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            }
+            FastTensorsError::InvalidData(s) => {
+                candle_core::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, s))
+            }
+            FastTensorsError::Conversion(e) => {
+                candle_core::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            }
+            FastTensorsError::UnknownDtype(s) => {
+                candle_core::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, s))
+            }
+            FastTensorsError::SafeTensors(e) => todo!(),
+            FastTensorsError::Candle(e) => todo!(),
+        }
+    }
+}
+
 pub(crate) static TENSOR_CACHE: Lazy<TensorCache> =
-    // TENSOR_CACHE is equivalent to the python global_stfiles
+    // TENSOR_CACHE is equivalent to the python global_tensorcache
     Lazy::new(|| TensorCache::new(TENSOR_CACHE_CAPACITY));
 pub(crate) static CONTEXT_CACHE: Lazy<ContextCache> =
     // CONTEXT_CACHE is equivalent to the python global_cm
     Lazy::new(|| ContextCache::new(CONTEXT_CACHE_CAPACITY));
 pub(crate) static STFILE_CACHE: Lazy<STFileCache> =
     Lazy::new(|| STFileCache::new(STFILE_CACHE_CAPACITY));
+    // TENSOR_CACHE is equivalent to the python global_stfiles
 
 struct STPage {
     file_descriptor: i32,
@@ -54,10 +100,11 @@ unsafe impl Send for PinnedMemory {}
 static PINNED_MEMORY: Lazy<PinnedMemory> = Lazy::new(|| {
     let mut buffer: *mut u8 = std::ptr::null_mut();
     unsafe {
-        Lib::cuMemAllocHost_v2(
-            &mut buffer as *mut *mut u8 as *mut *mut std::ffi::c_void,
-            PINNED_MEMORY_SIZE + MAX_BLOCK_SIZE,
-        );
+        //Lib::cuMemAllocHost_v2(
+        //    &mut buffer as *mut *mut u8 as *mut *mut std::ffi::c_void,
+        //    PINNED_MEMORY_SIZE + MAX_BLOCK_SIZE,
+        //);
+        // TODO: above approach does not work
     }
     assert!(!buffer.is_null(), "Unable to allocate pinned memory");
     let aligned_buffer =
@@ -78,40 +125,51 @@ static PINNED_MEMORY: Lazy<PinnedMemory> = Lazy::new(|| {
         pages,
     }
 });
-pub struct STFile {
+pub struct FastTensorFile {
     filename: String,
     header: serde_json::Value,
     header_size: usize,
     metadata: Option<serde_json::Value>,
-    handle: std::fs::File,
-    fast: bool,
+    mmap: Mmap,
     tensor_remap: Option<HashMap<String, String>>,
+    device: Arc<Device>,
+    pages: Vec<STPage>,
+    pinned_buffer: *mut u8,
+    aligned_buffer: *mut u8,
+    fast: bool,
 }
 
-impl STFile {
-    pub fn init<P: AsRef<Path>>(
+impl FastTensorFile {
+    pub fn open<P: AsRef<Path>>(
         filename: P,
+        device: Arc<Device>,
         fast: bool,
         keymap: Option<Vec<(String, String)>>,
-    ) -> Result<(), Error> {
-        let filename = filename.as_ref().to_str().unwrap().to_string();
-        let mut st_file = Self {
-            filename: filename.clone(),
-            header: serde_json::Value::Null,
-            header_size: 0,
-            metadata: None,
-            handle: std::fs::File::open(&filename)?,
-            fast,
-            tensor_remap: None,
-        };
+    ) -> Result<Arc<Self>, FastTensorsError> {
 
-        st_file.read_dict()?;
+        // Read from disk and map into memory
+        let file = File::open(&filename)?;
+        let mmap = unsafe { Mmap::map(&file)? };
 
-        if let Some(keymap) = keymap {
-            let mut tensor_remap = HashMap::new();
+        // Read header size (first 8 bytes)
+        let header_size = u64::from_le_bytes(mmap[..8].try_into().map_err(
+            |e| FastTensorsError::InvalidData(format!("Failed to convert slice: {}", e)))?) as usize;
+
+        // Parse header JSON
+        let mut header: Value = serde_json::from_slice(&mmap[8..8 + header_size]).map_err(
+            |e| FastTensorsError::InvalidData(format!("JSON parsing error: {}", e)))?;
+
+        // Extract metadata if present
+        let metadata = header.get("__metadata__").cloned();
+        if metadata.is_some() {
+            header.as_object_mut().unwrap().remove("__metadata__");
+        }
+
+        let tensor_remap = keymap.map(|keymap| {
+            let mut remap = HashMap::new();
             let mut new_header = serde_json::Map::new();
 
-            for (key, value) in st_file.header.as_object().unwrap() {
+            for (key, value) in header.as_object().unwrap() {
                 let mut new_key = key.clone();
                 for (from, to) in &keymap {
                     if from.starts_with('$') && new_key.starts_with(&from[1..]) {
@@ -121,68 +179,43 @@ impl STFile {
                     }
                 }
                 new_header.insert(new_key.clone(), value.clone());
-                tensor_remap.insert(new_key, key.clone());
+                remap.insert(new_key, key.clone());
             }
+            header = Value::Object(new_header);
+            remap
+        });
 
-            st_file.header = Value::Object(new_header);
-            st_file.tensor_remap = Some(tensor_remap);
-        }
-
-        if st_file.fast {
-            //st_file.handle = ext_c.safetensors_open
-            todo!()
-        }
-
-        STFILE_CACHE.insert(st_file.filename.clone(), st_file);
-
-        Ok(())
-    }
-
-    fn read_dict(&mut self) -> Result<(), STFileError> {
-        let file = File::open(&self.filename)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-
-        // Read header size (first 8 bytes)
-        let header_size = u64::from_le_bytes(mmap[..8].try_into()?) as usize;
-
-        // Parse header JSON
-        let header_end = 8 + header_size;
-        let header: Value = serde_json::from_slice(&mmap[8..header_end])?;
-
-        // Extract metadata if present
-        if let Some(obj) = header.as_object() {
-            if let Some(metadata) = obj.get("__metadata__") {
-                self.metadata = Some(metadata.clone());
-            }
-        }
-
-        // Store header without metadata
-        self.header = if let Value::Object(mut obj) = header {
-            obj.remove("__metadata__");
-            Value::Object(obj)
+        let (pinned_buffer, aligned_buffer) = if fast { 
+            Self::allocate_pinned_buffer()?
         } else {
-            header
+            (std::ptr::null_mut(), std::ptr::null_mut())
         };
 
-        self.header_size = header_end;
+        let stfile = Arc::new(Self {
+            filename: filename.as_ref().to_string_lossy().into_owned(),
+            header,
+            header_size: 8 + header_size,
+            metadata,
+            mmap,
+            tensor_remap,
+            device,
+            pages: Vec::new(),
+            pinned_buffer,
+            aligned_buffer,
+            fast,   
+        });
 
-        Ok(())
+        // Add to cache
+        STFILE_CACHE.insert(stfile.filename.clone(), stfile.clone());
+
+        Ok(stfile)
     }
 
-    pub fn open<P: AsRef<Path>>(
-        filename: P,
-        fast: bool,
-        keymap: Option<Vec<(String, String)>>,
-    ) -> Result<Arc<Self>, Error> {
-        let key = filename.as_ref().to_str().unwrap().to_string();
-        if let Some(st_file) = STFILE_CACHE.get(&key) {
-            return Ok(st_file.clone());
-        }
-        Self::init(filename, fast, keymap)?;
-        Ok(STFILE_CACHE.get(&key).unwrap().clone())
+    fn allocate_pinned_buffer() -> Result<(*mut u8, *mut u8), FastTensorsError> {
+        todo!()
     }
 
-    pub fn close(&mut self) -> Result<(), Error> {
+    pub fn close(&mut self) -> Result<(), FastTensorsError> {
         // Implementation
         todo!()
     }
@@ -195,18 +228,18 @@ impl STFile {
         self.metadata.as_ref()
     }
 
-    pub fn measure(&self, key: &str) -> Result<usize, Error> {
+    pub fn measure(&self, key: &str) -> Result<usize, FastTensorsError> {
         let v = self
             .header
             .get(key)
-            .ok_or_else(|| Error::SafeTensor(SafeTensorError::TensorNotFound(key.to_string())))?;
+            .ok_or_else(|| FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string())))?;
 
         let data_offsets = v["data_offsets"]
             .as_array()
-            .ok_or_else(|| Error::Msg(format!("Invalid data_offsets for key: {}", key)))?;
+            .ok_or_else(|| FastTensorsError::InvalidData(format!("Invalid data_offsets for key: {}", key)))?;
 
         if data_offsets.len() != 2 {
-            return Err(Error::Msg(format!(
+            return Err(FastTensorsError::InvalidData(format!(
                 "Expected 2 data_offsets, found {} for key: {}",
                 data_offsets.len(),
                 key
@@ -215,11 +248,11 @@ impl STFile {
 
         let start = data_offsets[0]
             .as_u64()
-            .ok_or_else(|| Error::Msg(format!("Invalid start offset for key: {}", key)))?
+            .ok_or_else(|| FastTensorsError::InvalidData(format!("Invalid start offset for key: {}", key)))?
             as usize;
         let end = data_offsets[1]
             .as_u64()
-            .ok_or_else(|| Error::Msg(format!("Invalid end offset for key: {}", key)))?
+            .ok_or_else(|| FastTensorsError::InvalidData(format!("Invalid end offset for key: {}", key)))?
             as usize;
 
         Ok(end - start)
@@ -231,7 +264,7 @@ impl STFile {
         device: &Device,
         not_fast: bool,
         out_dtype: Option<DType>,
-    ) -> Result<Tensor, Error> {
+    ) -> Result<Tensor, FastTensorsError> {
         let _ = device.synchronize(); //TODO review this
 
         let device_id = match device.location() {
@@ -252,7 +285,6 @@ impl STFile {
             return Ok(cached_tensor.as_ref().clone());
         }
 
-
         let tensor = if !self.fast || not_fast {
             self.load_tensor_slow(key, device)?
         } else {
@@ -267,7 +299,7 @@ impl STFile {
         todo!()
     }
 
-    fn load_tensor_slow(&self, key: &str, device: &Device) -> Result<Tensor, Error> {
+    fn load_tensor_slow(&self, key: &str, device: &Device) -> Result<Tensor, FastTensorsError> {
         let device_id = match device.location() {
             DeviceLocation::Cpu => "cpu".to_string(),
             DeviceLocation::Cuda { gpu_id } => format!("cuda:{}", gpu_id),
@@ -280,22 +312,22 @@ impl STFile {
                 .get(key)
                 .map(|tensor| tensor.clone())
                 .ok_or_else(|| {
-                    Error::SafeTensor(SafeTensorError::TensorNotFound(key.to_string()))
+                    FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string()))
                 });
         }
         let context = sf::load(&self.filename, device)
-            .map_err(|_| Error::SafeTensor(SafeTensorError::TensorNotFound(key.to_string())))?;
+            .map_err(|_| FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string())))?;
         CONTEXT_CACHE.insert(cache_key, context.clone());
 
         let tensor = context
             .get(key)
-            .ok_or_else(|| Error::SafeTensor(SafeTensorError::TensorNotFound(key.to_string())))?;
+            .ok_or_else(|| FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string())))?;
 
         Ok(tensor.clone())
     }
 
-    fn load_tensor_fast(&self, key: &str, device: &Device) -> Result<Tensor, Error> {
-        let cuda_device = match device.location() {
+    fn load_tensor_fast(&self, key: &str, device: &Device) -> Result<Tensor, FastTensorsError> {
+        /*let cuda_device = match device.location() {
             DeviceLocation::Cuda { gpu_id } => CudaDevice::new(gpu_id)?,
             _ => {
                 return Err(Error::Msg(
@@ -370,10 +402,11 @@ impl STFile {
         // Create a Tensor from the device buffer
         let tensor = Tensor::from_cuda_slice(device_buffer, &shape, dtype)?;
 
-        Ok(tensor)
+        Ok(tensor)*/
+        todo!()
     }
 
-    fn get_cache_page(&self, file_a: usize, file_b: usize) -> Result<&STPage, Error> {
+    /*fn get_cache_page(&self, file_a: usize, file_b: usize) -> Result<&STPage, Error> {
         let mut oldest_i = 0;
         let mut oldest = i64::MAX;
 
@@ -415,7 +448,7 @@ impl STFile {
         }
 
         Ok(page)
-    }
+    }*/
 }
 
 pub fn cleanup_stfiles() {
@@ -423,36 +456,14 @@ pub fn cleanup_stfiles() {
     todo!()
 }
 
-pub fn convert_dtype(dt: &str) -> Result<DType, Error> {
+pub fn convert_dtype(dt: &str) -> Result<DType, FastTensorsError> {
     // Implementation here
     todo!()
 }
 
-#[derive(Error, Debug)]
-pub enum STFileError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("Invalid data: {0}")]
-    InvalidData(String),
-    #[error("Slice conversion error: {0}")]
-    Conversion(#[from] std::array::TryFromSliceError),
-}
 
-impl From<STFileError> for Error {
-    fn from(error: STFileError) -> Self {
-        match error {
-            STFileError::Io(e) => Error::Io(e),
-            STFileError::Json(e) => {
-                Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-            }
-            STFileError::InvalidData(s) => {
-                Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, s))
-            }
-            STFileError::Conversion(e) => {
-                Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-            }
-        }
-    }
-}
+
+
+
+        //let header_json = std::str::from_utf8(&mmap[8..8 + header_size]).unwrap();
+        //let mut header: Value = serde_json::from_str(header_json)?;
