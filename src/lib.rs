@@ -1,7 +1,6 @@
 use cache::Cache;
 use candle_core::{safetensors as sf, DType, Device, DeviceLocation, Tensor};
 use memmap2::Mmap;
-use once_cell::sync::Lazy;
 use safetensors::tensor::SafeTensorError;
 use serde_json::Value;
 use std::cell::UnsafeCell;
@@ -9,7 +8,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::AtomicI32;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 //mod config;
 mod cache;
 mod op;
@@ -69,15 +68,16 @@ impl From<FastTensorsError> for candle_core::Error {
     }
 }
 
-pub(crate) static TENSOR_CACHE: Lazy<TensorCache> =
-    // TENSOR_CACHE is equivalent to the python global_tensorcache
-    Lazy::new(|| TensorCache::new(TENSOR_CACHE_CAPACITY));
-pub(crate) static CONTEXT_CACHE: Lazy<ContextCache> =
-    // CONTEXT_CACHE is equivalent to the python global_cm
-    Lazy::new(|| ContextCache::new(CONTEXT_CACHE_CAPACITY));
-pub(crate) static STFILE_CACHE: Lazy<STFileCache> =
-    Lazy::new(|| STFileCache::new(STFILE_CACHE_CAPACITY));
-    // TENSOR_CACHE is equivalent to the python global_stfiles
+pub(crate) static TENSOR_CACHE: OnceLock<TensorCache> = OnceLock::new();
+pub(crate) static CONTEXT_CACHE: OnceLock<ContextCache> = OnceLock::new();
+//pub(crate) static STFILE_CACHE: OnceLock<STFileCache> = OnceLock::new();
+
+// Initialize the caches
+pub(crate) fn init_caches() {
+    TENSOR_CACHE.get_or_init(|| TensorCache::new(TENSOR_CACHE_CAPACITY));
+    CONTEXT_CACHE.get_or_init(|| ContextCache::new(CONTEXT_CACHE_CAPACITY));
+    //STFILE_CACHE.get_or_init(|| STFileCache::new(STFILE_CACHE_CAPACITY));
+}
 
 struct STPage {
     file_descriptor: i32,
@@ -88,43 +88,7 @@ struct STPage {
     ptr: *mut u8,
 }
 
-struct PinnedMemory {
-    buffer: UnsafeCell<*mut u8>,
-    aligned_buffer: UnsafeCell<*mut u8>,
-    pages: [STPage; MAX_PAGES],
-}
 
-unsafe impl Sync for PinnedMemory {}
-unsafe impl Send for PinnedMemory {}
-
-static PINNED_MEMORY: Lazy<PinnedMemory> = Lazy::new(|| {
-    let mut buffer: *mut u8 = std::ptr::null_mut();
-    unsafe {
-        //Lib::cuMemAllocHost_v2(
-        //    &mut buffer as *mut *mut u8 as *mut *mut std::ffi::c_void,
-        //    PINNED_MEMORY_SIZE + MAX_BLOCK_SIZE,
-        //);
-        // TODO: above approach does not work
-    }
-    assert!(!buffer.is_null(), "Unable to allocate pinned memory");
-    let aligned_buffer =
-        unsafe { buffer.add(MAX_BLOCK_SIZE - 1) as usize & !(MAX_BLOCK_SIZE - 1) } as *mut u8;
-
-    let pages = std::array::from_fn(|i| STPage {
-        file_descriptor: -1,
-        file_a: 0,
-        file_b: 0,
-        access: -1,
-        locks: AtomicI32::new(0),
-        ptr: unsafe { aligned_buffer.add(i * PAGESIZE) },
-    });
-
-    PinnedMemory {
-        buffer: UnsafeCell::new(buffer),
-        aligned_buffer: UnsafeCell::new(aligned_buffer),
-        pages,
-    }
-});
 pub struct FastTensorFile {
     filename: String,
     header: serde_json::Value,
@@ -206,7 +170,7 @@ impl FastTensorFile {
         });
 
         // Add to cache
-        STFILE_CACHE.insert(stfile.filename.clone(), stfile.clone());
+        //STFILE_CACHE.insert(stfile.filename.clone(), stfile.clone());
 
         Ok(stfile)
     }
@@ -281,7 +245,7 @@ impl FastTensorFile {
 
         let cache_key = format!("{}::{}::{}", self.filename, key, device_id);
 
-        if let Some(cached_tensor) = TENSOR_CACHE.get(&cache_key) {
+        if let Some(cached_tensor) = TENSOR_CACHE.get().unwrap().get(&cache_key) {
             return Ok(cached_tensor.as_ref().clone());
         }
 
@@ -307,7 +271,7 @@ impl FastTensorFile {
         };
         let cache_key = format!("{}::{}", self.filename, device_id);
 
-        if let Some(context) = CONTEXT_CACHE.get(&cache_key) {
+        if let Some(context) = CONTEXT_CACHE.get().unwrap().get(&cache_key) {
             return context
                 .get(key)
                 .map(|tensor| tensor.clone())
@@ -317,7 +281,7 @@ impl FastTensorFile {
         }
         let context = sf::load(&self.filename, device)
             .map_err(|_| FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string())))?;
-        CONTEXT_CACHE.insert(cache_key, context.clone());
+        CONTEXT_CACHE.get().unwrap().insert(cache_key, context.clone());
 
         let tensor = context
             .get(key)

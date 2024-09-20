@@ -1,26 +1,30 @@
-use candle_core::cuda::cudarc::driver::{
+use io_uring::{opcode, types, IoUring};
+use candle_core::{cuda::cudarc::driver::{
     sys::{CUresult, CUstream, Lib},
     CudaStream,
+}, Device, Tensor};
+
+use std::{
+    ffi::OsStr, os::{raw::c_void, unix::{fs::MetadataExt, io::{AsRawFd, RawFd}}}, path::{Path, PathBuf}, ptr::NonNull, sync::{atomic::{AtomicUsize, Ordering}, Arc, OnceLock}
 };
-use io_uring::{opcode, types, IoUring};
-use std::os::raw::c_void;
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::{ffi::OsStr, mem::MaybeUninit};
-use tokio::fs::File;
+use tokio::{
+    fs::{File, OpenOptions},
+    io,
+    runtime::Runtime,
+};
 
 use crate::{
     cache::Cache,
     op::{allocate_pinned_memory, free_pinned_memory},
 };
 
+
 const Q_DEPTH: u32 = 8;
 const MAX_PAGES: usize = 4;
 const MAX_BLOCK_SIZE: usize = 128 * 1024; // 128 KB
 const PAGE_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 const PINNED_MEMORY: usize = MAX_PAGES * PAGE_SIZE; // 64 MB
+const O_DIRECT: i32 = 0x4000; // Linux
 
 static CUDA_LIB: OnceLock<Lib> = OnceLock::new();
 pub fn get_cuda_lib() -> &'static Lib {
@@ -300,4 +304,74 @@ impl Drop for PinnedMemory {
             eprintln!("Error freeing pinned memory: {:?}", e);
         }
     }
+}
+
+// Aligned buffer for direct I/O
+#[repr(align(4096))] // Typical alignment for direct I/O, adjust if needed
+struct AlignedBuffer {
+    buffer: Box<[u8]>,
+}
+
+impl AlignedBuffer {
+    fn new(size: usize) -> Self {
+        Self {
+            buffer: vec![0u8; size].into_boxed_slice(),
+        }
+    }
+}
+
+pub struct SafeTensorFile {
+    file: File,
+    filesize: u64,
+    block_size: u64,
+    padded_size: u64,
+}
+
+impl SafeTensorFile {
+    pub async fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECT)
+            .open(path)
+            .await?;
+
+        let metadata = file.metadata().await?;
+        let filesize = metadata.len();
+        let block_size = metadata.blksize();
+        let padded_size = (filesize + block_size - 1) / block_size;
+
+        Ok(Self {
+            file,
+            filesize,
+            block_size,
+            padded_size,
+        })
+    }
+    pub async fn load(
+        &mut self,
+        target: &mut Tensor,
+        offset: usize,
+        length: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+
+        let device = target.device();
+        
+
+
+
+
+        todo!()
+    }
+}
+
+pub fn safetensors_load(
+    path: PathBuf,
+    target: &mut Tensor,
+    offset: usize,
+    length: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Runtime::new()?.block_on(async {
+        let mut file = SafeTensorFile::new(path).await?;
+        file.load(target, offset, length).await
+    })
 }
