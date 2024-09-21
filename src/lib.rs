@@ -1,18 +1,21 @@
 use cache::Cache;
 use candle_core::{safetensors as sf, DType, Device, DeviceLocation, Tensor};
+use mem::{safetensors_load, SafeTensorFile};
 use memmap2::Mmap;
 use safetensors::tensor::SafeTensorError;
 use serde_json::Value;
-use std::cell::UnsafeCell;
+use utils::serialize_tensor;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::AtomicI32;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use half::{bf16, f16};
+
 //mod config;
 mod cache;
 mod op;
 mod mem;
+mod utils;
 
 const MAX_BLOCK_SIZE: usize = 128 * 1024;
 const MAX_PAGES: usize = 4;
@@ -70,22 +73,13 @@ impl From<FastTensorsError> for candle_core::Error {
 
 pub(crate) static TENSOR_CACHE: OnceLock<TensorCache> = OnceLock::new();
 pub(crate) static CONTEXT_CACHE: OnceLock<ContextCache> = OnceLock::new();
-//pub(crate) static STFILE_CACHE: OnceLock<STFileCache> = OnceLock::new();
+pub(crate) static STFILE_CACHE: OnceLock<STFileCache> = OnceLock::new();
 
 // Initialize the caches
 pub(crate) fn init_caches() {
     TENSOR_CACHE.get_or_init(|| TensorCache::new(TENSOR_CACHE_CAPACITY));
     CONTEXT_CACHE.get_or_init(|| ContextCache::new(CONTEXT_CACHE_CAPACITY));
-    //STFILE_CACHE.get_or_init(|| STFileCache::new(STFILE_CACHE_CAPACITY));
-}
-
-struct STPage {
-    file_descriptor: i32,
-    file_a: usize,
-    file_b: usize,
-    access: i64,
-    locks: AtomicI32,
-    ptr: *mut u8,
+    STFILE_CACHE.get_or_init(|| STFileCache::new(STFILE_CACHE_CAPACITY));
 }
 
 
@@ -94,22 +88,23 @@ pub struct FastTensorFile {
     header: serde_json::Value,
     header_size: usize,
     metadata: Option<serde_json::Value>,
-    mmap: Mmap,
     tensor_remap: Option<HashMap<String, String>>,
-    device: Arc<Device>,
-    pages: Vec<STPage>,
-    pinned_buffer: *mut u8,
-    aligned_buffer: *mut u8,
     fast: bool,
+    file_handle: Mutex<SafeTensorFile>,
 }
 
 impl FastTensorFile {
-    pub fn open<P: AsRef<Path>>(
+    pub async fn open<P: AsRef<Path>>(
         filename: P,
-        device: Arc<Device>,
         fast: bool,
         keymap: Option<Vec<(String, String)>>,
     ) -> Result<Arc<Self>, FastTensorsError> {
+
+        // Check if the file is already in the cache
+        let filename_str = filename.as_ref().to_string_lossy().into_owned();
+        if let Some(cached_file) = STFILE_CACHE.get().unwrap().get(&filename_str) {
+            return Ok(cached_file.clone());
+        }   
 
         // Read from disk and map into memory
         let file = File::open(&filename)?;
@@ -149,39 +144,30 @@ impl FastTensorFile {
             remap
         });
 
-        let (pinned_buffer, aligned_buffer) = if fast { 
-            Self::allocate_pinned_buffer()?
-        } else {
-            (std::ptr::null_mut(), std::ptr::null_mut())
-        };
+        let file = SafeTensorFile::new(filename_str.clone()).await?;
 
         let stfile = Arc::new(Self {
-            filename: filename.as_ref().to_string_lossy().into_owned(),
+            filename: filename_str.clone(),
             header,
-            header_size: 8 + header_size,
+            header_size,
             metadata,
-            mmap,
             tensor_remap,
-            device,
-            pages: Vec::new(),
-            pinned_buffer,
-            aligned_buffer,
-            fast,   
+            fast,
+            file_handle: Mutex::new(file),
         });
-
-        // Add to cache
-        //STFILE_CACHE.insert(stfile.filename.clone(), stfile.clone());
-
+    
+        // Add the new FastTensorFile to the cache
+        STFILE_CACHE.get().unwrap().insert(filename_str, stfile.clone());
+    
         Ok(stfile)
     }
 
-    fn allocate_pinned_buffer() -> Result<(*mut u8, *mut u8), FastTensorsError> {
-        todo!()
-    }
-
     pub fn close(&mut self) -> Result<(), FastTensorsError> {
-        // Implementation
-        todo!()
+        if self.fast {
+
+        }
+        
+        Ok(())
     }
 
     pub fn get_dict(&self) -> &serde_json::Value {
@@ -228,7 +214,7 @@ impl FastTensorFile {
         device: &Device,
         not_fast: bool,
         out_dtype: Option<DType>,
-    ) -> Result<Tensor, FastTensorsError> {
+    ) -> Result<Arc<Tensor>, FastTensorsError> {
         let _ = device.synchronize(); //TODO review this
 
         let device_id = match device.location() {
@@ -246,21 +232,20 @@ impl FastTensorFile {
         let cache_key = format!("{}::{}::{}", self.filename, key, device_id);
 
         if let Some(cached_tensor) = TENSOR_CACHE.get().unwrap().get(&cache_key) {
-            return Ok(cached_tensor.as_ref().clone());
+            return Ok(cached_tensor);
         }
 
-        let tensor = if !self.fast || not_fast {
+        let tensor = if not_fast {
             self.load_tensor_slow(key, device)?
         } else {
             self.load_tensor_fast(key, device)?
         };
+        
+        let tensor = Arc::new(tensor);
 
-        // Add to cache if caching is enabled
-        //if cached {
-        //    GLOBAL_TENSOR_CACHE.insert(cache_key, tensor.clone());
-        //}
-
-        todo!()
+        TENSOR_CACHE.get().unwrap().insert(cache_key, tensor.clone());
+        
+        Ok(tensor)
     }
 
     fn load_tensor_slow(&self, key: &str, device: &Device) -> Result<Tensor, FastTensorsError> {
@@ -291,138 +276,70 @@ impl FastTensorFile {
     }
 
     fn load_tensor_fast(&self, key: &str, device: &Device) -> Result<Tensor, FastTensorsError> {
-        /*let cuda_device = match device.location() {
-            DeviceLocation::Cuda { gpu_id } => CudaDevice::new(gpu_id)?,
-            _ => {
-                return Err(Error::Msg(
-                    "Fast tensor loading is only supported for CUDA devices".to_string(),
-                ))
-            }
-        };
-
-        let tensor_info = self
-            .header
-            .get(key)
-            .ok_or_else(|| Error::SafeTensor(SafeTensorError::TensorNotFound(key.to_string())))?;
-
-        let dtype = convert_dtype(&tensor_info["dtype"].as_str().unwrap())?;
-        let shape: Vec<usize> = tensor_info["shape"]
-            .as_array()
-            .unwrap()
+        let header_info = self.header.get(key).ok_or_else(|| 
+            FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string())))?;
+    
+        let dtype = convert_dtype(&header_info["dtype"].as_str().unwrap())?;
+        let shape: Vec<usize> = header_info["shape"].as_array().unwrap()
             .iter()
             .map(|v| v.as_u64().unwrap() as usize)
             .collect();
+    
+        let data_offsets = header_info["data_offsets"].as_array().unwrap();
+        let start_offset = data_offsets[0].as_u64().unwrap() as usize;
+        let end_offset = data_offsets[1].as_u64().unwrap() as usize;
+        let length = end_offset - start_offset;
+    
+        let tensor = Tensor::zeros(shape, dtype, device)?;
+        let mut target: Vec<u8> = Vec::new();
 
-        let data_offsets = tensor_info["data_offsets"].as_array().unwrap();
-        let offset = data_offsets[0].as_u64().unwrap() as usize + self.header_size;
-        let length =
-            (data_offsets[1].as_u64().unwrap() - data_offsets[0].as_u64().unwrap()) as usize;
+        serialize_tensor(&mut target, &tensor)?;
 
-        // Ensure the tensor shape matches the storage size
-        let expected_size = shape.iter().product::<usize>() * dtype.size_in_bytes();
-        if expected_size != length {
-            return Err(Error::Msg(format!(
-                "Tensor shape doesn't match storage size for key: {}",
-                key
-            )));
-        }
-
-        // Allocate device memory
-        let mut device_buffer: CudaSlice<u8> = unsafe { cuda_device.alloc(length)? };
-
-        // Load data using pinned memory and async copy
-        let mut tensor_offset = 0;
-        let mut file_b = offset / PAGESIZE * PAGESIZE;
-
-        while tensor_offset < length {
-            let file_a = file_b;
-            file_b += PAGESIZE;
-
-            let page = self.get_cache_page(file_a, file_b)?;
-            let left = (offset - file_a).max(0) as usize;
-            let right = (offset + length - file_a).min(PAGESIZE) as usize;
-            let copy_len = right - left;
-
-            let src = unsafe { page.ptr.add(left) };
-            let dst = unsafe { device_buffer.as_mut_ptr().add(tensor_offset) };
-
-            page.locks.fetch_add(1, Ordering::SeqCst);
-            unsafe {
-                cuda_device.memcpy_async(
-                    dst,
-                    src,
-                    copy_len,
-                    MemcpyKind::HostToDevice,
-                    None, // Use default stream
-                )?;
-            }
-            cuda_device.add_callback(None, move |_| {
-                page.locks.fetch_sub(1, Ordering::SeqCst);
-            })?;
-
-            tensor_offset += copy_len;
-        }
-
-        // Create a Tensor from the device buffer
-        let tensor = Tensor::from_cuda_slice(device_buffer, &shape, dtype)?;
-
-        Ok(tensor)*/
-        todo!()
+        safetensors_load(
+            &mut *self.file_handle.lock().unwrap(),
+            &mut target,
+            start_offset + self.header_size,
+            length,
+            device,
+        ).map_err(|e| FastTensorsError::SafeTensors(
+            SafeTensorError::TensorNotFound(e.to_string())))?;
+    
+        Ok(tensor)
     }
-
-    /*fn get_cache_page(&self, file_a: usize, file_b: usize) -> Result<&STPage, Error> {
-        let mut oldest_i = 0;
-        let mut oldest = i64::MAX;
-
-        // Find existing page in cache or the oldest page to evict
-        for (i, page) in PINNED_MEMORY.pages.iter().enumerate() {
-            if page.file_descriptor == self.file_descriptor
-                && page.file_a == file_a
-                && page.file_b == file_b
-            {
-                return Ok(page);
-            }
-            if page.locks.load(Ordering::SeqCst) == 0 && page.access < oldest {
-                oldest_i = i;
-                oldest = page.access;
-            }
-        }
-
-        // Load new page
-        let page = &mut PINNED_MEMORY.pages[oldest_i];
-        page.file_a = file_a;
-        page.file_b = file_b;
-        page.file_descriptor = self.file_descriptor;
-
-        // Use Linux AIO to read the page
-        let mut aiocb = nix::sys::aio::AioCb::from_slice(
-            self.file_descriptor,
-            file_a as i64,
-            unsafe { std::slice::from_raw_parts_mut(page.ptr, PAGESIZE) },
-            0,
-            nix::sys::aio::LioOpcode::LIO_READ,
-        );
-
-        nix::sys::aio::aio_read(&mut aiocb)?;
-        nix::sys::aio::aio_suspend(&[&aiocb], None)?;
-
-        let result = nix::sys::aio::aio_return(&aiocb)?;
-        if result as usize != PAGESIZE {
-            return Err(Error::Msg("Async read error".to_string()));
-        }
-
-        Ok(page)
-    }*/
-}
-
-pub fn cleanup_stfiles() {
-    // Implementation
-    todo!()
+    
 }
 
 pub fn convert_dtype(dt: &str) -> Result<DType, FastTensorsError> {
-    // Implementation here
-    todo!()
+    match dt {
+        //"I32" => Ok(DType::I32),
+        //"I16" => Ok(DType::I16),
+        "F16" => Ok(DType::F16),
+        "BF16" => Ok(DType::BF16),
+        "F32" => Ok(DType::F32),
+        _ => Err(FastTensorsError::UnknownDtype(dt.to_string())),
+    }
+}
+
+pub fn cleanup() {
+    if let Some(cache) = STFILE_CACHE.get() {
+        // Remove all FastTensorFile instances from the cache
+        cache.clear();
+    }
+    // Clear other caches as well
+    if let Some(cache) = TENSOR_CACHE.get() {
+        cache.clear();
+    }
+    if let Some(cache) = CONTEXT_CACHE.get() {
+        cache.clear();
+    }
+}
+
+impl Drop for FastTensorFile {
+    fn drop(&mut self) {
+        if let Err(e) = self.close() {
+            eprintln!("Error during FastTensorFile cleanup: {:?}", e);
+        }
+    }
 }
 
 

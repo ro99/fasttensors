@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::hash::Hash;
 
 pub struct Cache<K, T> {
-    cache: Mutex<LruCache<K, Arc<T>>>,
+    cache: Mutex<LruCache<K, Arc<T>>>,  //TODO: review the need of Mutex
 }
 
 impl<K, T> Cache<K, T>
@@ -34,6 +34,16 @@ where
     pub fn pop_lru(&self) -> Option<(K, Arc<T>)> {
         let mut cache = self.cache.lock().unwrap();
         cache.pop_lru().map(|(k, v)| (k, v.clone()))
+    }
+
+    pub fn remove(&self, key: &K) -> Option<Arc<T>> {
+        let mut cache = self.cache.lock().unwrap();
+        cache.pop(key)
+    }
+
+    pub fn clear(&self) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.clear();
     }
 }
 

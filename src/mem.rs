@@ -1,11 +1,24 @@
+use candle_core::{
+    cuda::cudarc::driver::{
+        sys::{CUresult, CUstream, Lib},
+        CudaStream,
+    },
+    quantized::QTensor,
+    Device, Tensor,
+};
 use io_uring::{opcode, types, IoUring};
-use candle_core::{cuda::cudarc::driver::{
-    sys::{CUresult, CUstream, Lib},
-    CudaStream,
-}, Device, Tensor};
 
 use std::{
-    ffi::OsStr, os::{raw::c_void, unix::{fs::MetadataExt, io::{AsRawFd, RawFd}}}, path::{Path, PathBuf}, ptr::NonNull, sync::{atomic::{AtomicUsize, Ordering}, Arc, OnceLock}
+    borrow::Borrow, ffi::OsStr, os::{
+        raw::c_void,
+        unix::{
+            fs::MetadataExt,
+            io::{AsRawFd, RawFd},
+        },
+    }, path::{Path, PathBuf}, ptr::NonNull, sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+    }
 };
 use tokio::{
     fs::{File, OpenOptions},
@@ -17,7 +30,6 @@ use crate::{
     cache::Cache,
     op::{allocate_pinned_memory, free_pinned_memory},
 };
-
 
 const Q_DEPTH: u32 = 8;
 const MAX_PAGES: usize = 4;
@@ -33,6 +45,10 @@ pub fn get_cuda_lib() -> &'static Lib {
         unsafe { Lib::new(cuda_path).expect("Failed to load CUDA library") }
     })
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("CUDA error: {0:?}")]
+struct CudaError(CUresult);
 
 pub struct GpuOpCell {
     count: AtomicUsize,
@@ -349,29 +365,72 @@ impl SafeTensorFile {
     }
     pub async fn load(
         &mut self,
-        target: &mut Tensor,
+        target: &mut Vec<u8>,
         offset: usize,
         length: usize,
+        device: &Device,
     ) -> Result<(), Box<dyn std::error::Error>> {
-
-        let device = target.device();
         
 
+        let pinned_memory = PinnedMemory::new().map_err(CudaError)?;
 
+        let mut tensor_offset = 0;
+        let mut file_b = offset / PAGE_SIZE * PAGE_SIZE;
 
+        while tensor_offset < length {
+            let file_a = file_b;
+            file_b += PAGE_SIZE;
 
-        todo!()
+            let page = pinned_memory
+                .get_cache_page(&mut self.file, self.filesize as usize, file_a, file_b)
+                .await?;
+
+            let left = (offset - file_a).max(0);
+            let right = (offset + length - file_a).min(PAGE_SIZE);
+            let copy_len = right - left;
+
+            let src = unsafe { page.get_ptr().as_ptr().add(left) };
+            let dst = unsafe { target.as_mut_ptr().add(tensor_offset) };
+
+            match device {
+                Device::Cpu => unsafe {
+                    std::ptr::copy_nonoverlapping(src, dst, copy_len);
+                },
+                Device::Cuda(_) => {
+                    let cuda_lib = get_cuda_lib();
+
+                    let stream = match device {
+                        Device::Cuda(device) => device.cuda_device().fork_default_stream()?,
+                        _ => return Err("Unsupported device".into()),
+                    };
+                    unsafe {
+                        cuda_lib
+                            .cuMemcpyAsync(dst as u64, src as u64, copy_len, stream.stream)
+                            .result()?;
+                    }
+                    page.gpu_op_cell.increment();
+                    unsafe {
+                        page.gpu_op_cell.add_callback_to_stream(cuda_lib, &stream)?;
+                    }
+                }
+                _ => return Err("Unsupported device".into()),
+            }
+
+            tensor_offset += copy_len;
+        }
+
+        Ok(())
     }
 }
 
 pub fn safetensors_load(
-    path: PathBuf,
-    target: &mut Tensor,
+    handle: &mut SafeTensorFile,
+    target: &mut Vec<u8>,
     offset: usize,
     length: usize,
+    device: &Device,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Runtime::new()?.block_on(async {
-        let mut file = SafeTensorFile::new(path).await?;
-        file.load(target, offset, length).await
+        handle.load(target, offset, length, device).await
     })
 }
