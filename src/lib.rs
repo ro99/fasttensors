@@ -1,20 +1,20 @@
 use cache::Cache;
 use candle_core::{safetensors as sf, DType, Device, DeviceLocation, Tensor};
+use half::{bf16, f16};
 use mem::{safetensors_load, SafeTensorFile};
 use memmap2::Mmap;
 use safetensors::tensor::SafeTensorError;
 use serde_json::Value;
-use utils::serialize_tensor;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
-use half::{bf16, f16};
+use utils::serialize_tensor;
 
 //mod config;
 mod cache;
-mod op;
 mod mem;
+mod op;
 mod utils;
 
 const MAX_BLOCK_SIZE: usize = 128 * 1024;
@@ -47,7 +47,6 @@ pub enum FastTensorsError {
     #[error("Unknown dtype: {0}")]
     UnknownDtype(String),
 }
-
 
 impl From<FastTensorsError> for candle_core::Error {
     fn from(error: FastTensorsError) -> Self {
@@ -82,7 +81,6 @@ pub(crate) fn init_caches() {
     STFILE_CACHE.get_or_init(|| STFileCache::new(STFILE_CACHE_CAPACITY));
 }
 
-
 pub struct FastTensorFile {
     filename: String,
     header: serde_json::Value,
@@ -99,24 +97,24 @@ impl FastTensorFile {
         fast: bool,
         keymap: Option<Vec<(String, String)>>,
     ) -> Result<Arc<Self>, FastTensorsError> {
-
         // Check if the file is already in the cache
         let filename_str = filename.as_ref().to_string_lossy().into_owned();
         if let Some(cached_file) = STFILE_CACHE.get().unwrap().get(&filename_str) {
             return Ok(cached_file.clone());
-        }   
+        }
 
         // Read from disk and map into memory
         let file = File::open(&filename)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
         // Read header size (first 8 bytes)
-        let header_size = u64::from_le_bytes(mmap[..8].try_into().map_err(
-            |e| FastTensorsError::InvalidData(format!("Failed to convert slice: {}", e)))?) as usize;
+        let header_size = u64::from_le_bytes(mmap[..8].try_into().map_err(|e| {
+            FastTensorsError::InvalidData(format!("Failed to convert slice: {}", e))
+        })?) as usize;
 
         // Parse header JSON
-        let mut header: Value = serde_json::from_slice(&mmap[8..8 + header_size]).map_err(
-            |e| FastTensorsError::InvalidData(format!("JSON parsing error: {}", e)))?;
+        let mut header: Value = serde_json::from_slice(&mmap[8..8 + header_size])
+            .map_err(|e| FastTensorsError::InvalidData(format!("JSON parsing error: {}", e)))?;
 
         // Extract metadata if present
         let metadata = header.get("__metadata__").cloned();
@@ -155,18 +153,19 @@ impl FastTensorFile {
             fast,
             file_handle: Mutex::new(file),
         });
-    
+
         // Add the new FastTensorFile to the cache
-        STFILE_CACHE.get().unwrap().insert(filename_str, stfile.clone());
-    
+        STFILE_CACHE
+            .get()
+            .unwrap()
+            .insert(filename_str, stfile.clone());
+
         Ok(stfile)
     }
 
     pub fn close(&mut self) -> Result<(), FastTensorsError> {
-        if self.fast {
+        if self.fast {}
 
-        }
-        
         Ok(())
     }
 
@@ -179,14 +178,13 @@ impl FastTensorFile {
     }
 
     pub fn measure(&self, key: &str) -> Result<usize, FastTensorsError> {
-        let v = self
-            .header
-            .get(key)
-            .ok_or_else(|| FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string())))?;
+        let v = self.header.get(key).ok_or_else(|| {
+            FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string()))
+        })?;
 
-        let data_offsets = v["data_offsets"]
-            .as_array()
-            .ok_or_else(|| FastTensorsError::InvalidData(format!("Invalid data_offsets for key: {}", key)))?;
+        let data_offsets = v["data_offsets"].as_array().ok_or_else(|| {
+            FastTensorsError::InvalidData(format!("Invalid data_offsets for key: {}", key))
+        })?;
 
         if data_offsets.len() != 2 {
             return Err(FastTensorsError::InvalidData(format!(
@@ -196,19 +194,17 @@ impl FastTensorFile {
             )));
         }
 
-        let start = data_offsets[0]
-            .as_u64()
-            .ok_or_else(|| FastTensorsError::InvalidData(format!("Invalid start offset for key: {}", key)))?
-            as usize;
-        let end = data_offsets[1]
-            .as_u64()
-            .ok_or_else(|| FastTensorsError::InvalidData(format!("Invalid end offset for key: {}", key)))?
-            as usize;
+        let start = data_offsets[0].as_u64().ok_or_else(|| {
+            FastTensorsError::InvalidData(format!("Invalid start offset for key: {}", key))
+        })? as usize;
+        let end = data_offsets[1].as_u64().ok_or_else(|| {
+            FastTensorsError::InvalidData(format!("Invalid end offset for key: {}", key))
+        })? as usize;
 
         Ok(end - start)
     }
 
-    pub fn get_tensor(
+    pub async fn get_tensor(
         &self,
         key: &String,
         device: &Device,
@@ -236,19 +232,26 @@ impl FastTensorFile {
         }
 
         let tensor = if not_fast {
-            self.load_tensor_slow(key, device)?
+            self.load_tensor_slow(key, device).await?
         } else {
-            self.load_tensor_fast(key, device)?
+            self.load_tensor_fast(key, device).await?
         };
-        
+
         let tensor = Arc::new(tensor);
 
-        TENSOR_CACHE.get().unwrap().insert(cache_key, tensor.clone());
-        
+        TENSOR_CACHE
+            .get()
+            .unwrap()
+            .insert(cache_key, tensor.clone());
+
         Ok(tensor)
     }
 
-    fn load_tensor_slow(&self, key: &str, device: &Device) -> Result<Tensor, FastTensorsError> {
+    async fn load_tensor_slow(
+        &self,
+        key: &str,
+        device: &Device,
+    ) -> Result<Tensor, FastTensorsError> {
         let device_id = match device.location() {
             DeviceLocation::Cpu => "cpu".to_string(),
             DeviceLocation::Cuda { gpu_id } => format!("cuda:{}", gpu_id),
@@ -264,32 +267,43 @@ impl FastTensorFile {
                     FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string()))
                 });
         }
-        let context = sf::load(&self.filename, device)
-            .map_err(|_| FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string())))?;
-        CONTEXT_CACHE.get().unwrap().insert(cache_key, context.clone());
+        let context = sf::load(&self.filename, device).map_err(|_| {
+            FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string()))
+        })?;
+        CONTEXT_CACHE
+            .get()
+            .unwrap()
+            .insert(cache_key, context.clone());
 
-        let tensor = context
-            .get(key)
-            .ok_or_else(|| FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string())))?;
+        let tensor = context.get(key).ok_or_else(|| {
+            FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string()))
+        })?;
 
         Ok(tensor.clone())
     }
 
-    fn load_tensor_fast(&self, key: &str, device: &Device) -> Result<Tensor, FastTensorsError> {
-        let header_info = self.header.get(key).ok_or_else(|| 
-            FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string())))?;
-    
+    async fn load_tensor_fast(
+        &self,
+        key: &str,
+        device: &Device,
+    ) -> Result<Tensor, FastTensorsError> {
+        let header_info = self.header.get(key).ok_or_else(|| {
+            FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string()))
+        })?;
+
         let dtype = convert_dtype(&header_info["dtype"].as_str().unwrap())?;
-        let shape: Vec<usize> = header_info["shape"].as_array().unwrap()
+        let shape: Vec<usize> = header_info["shape"]
+            .as_array()
+            .unwrap()
             .iter()
             .map(|v| v.as_u64().unwrap() as usize)
             .collect();
-    
+
         let data_offsets = header_info["data_offsets"].as_array().unwrap();
         let start_offset = data_offsets[0].as_u64().unwrap() as usize;
         let end_offset = data_offsets[1].as_u64().unwrap() as usize;
         let length = end_offset - start_offset;
-    
+
         let tensor = Tensor::zeros(shape, dtype, device)?;
         let mut target: Vec<u8> = Vec::new();
 
@@ -301,18 +315,19 @@ impl FastTensorFile {
             start_offset + self.header_size,
             length,
             device,
-        ).map_err(|e| FastTensorsError::SafeTensors(
-            SafeTensorError::TensorNotFound(e.to_string())))?;
-    
+        )
+        .await.map_err(|e| {
+            FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(e.to_string()))
+        })?;
+
         Ok(tensor)
     }
-    
 }
 
 pub fn convert_dtype(dt: &str) -> Result<DType, FastTensorsError> {
     match dt {
-        //"I32" => Ok(DType::I32),
-        //"I16" => Ok(DType::I16),
+        "I32" => Ok(DType::I32),
+        "I16" => Ok(DType::I16),
         "F16" => Ok(DType::F16),
         "BF16" => Ok(DType::BF16),
         "F32" => Ok(DType::F32),
@@ -342,9 +357,48 @@ impl Drop for FastTensorFile {
     }
 }
 
+//let header_json = std::str::from_utf8(&mmap[8..8 + header_size]).unwrap();
+//let mut header: Value = serde_json::from_str(header_json)?;
 
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+    use std::path::PathBuf;
 
 
-        //let header_json = std::str::from_utf8(&mmap[8..8 + header_size]).unwrap();
-        //let mut header: Value = serde_json::from_str(header_json)?;
+    #[tokio::test]
+    async fn test_fast_tensor_file_comparison() -> Result<(), FastTensorsError> {
+        // Initialize caches
+        init_caches();
+
+        // Create a test safetensors file path
+        let test_file = PathBuf::from("/home/rodrigo/AI/Models/Exllama/Mistral-Nemo-12B/Lumimaid-v0.2-12B-8.0bpw-h8-exl2-rpcal/output-00001-of-00002.safetensors");
+
+        // Open the FastTensorFile
+        let fast_tensor_file = FastTensorFile::open(&test_file, true, None).await?;
+
+        // Test key
+        let key = "model.layers.11.self_attn.o_proj.q_weight";
+        println!("Testing key: {}", key);
+
+        // Get CUDA device (assuming CUDA is available, otherwise use CPU)
+        let device = Device::cuda_if_available(0)?;
+
+        // Get tensor using fast method
+        let tensor_fast = fast_tensor_file
+            .get_tensor(&key.to_string(), &device, false, None)
+            .await?;
+
+        // Get tensor using slow method
+        let tensor_slow = fast_tensor_file
+            .get_tensor(&key.to_string(), &device, true, None)
+            .await?;
+
+        // Cleanup
+        cleanup();
+
+        Ok(())
+    }
+}

@@ -18,6 +18,8 @@ pub(crate) fn serialize_tensor(buffer: &mut Vec<u8>, tensor: &Tensor) -> Result<
         DType::U8 => data_to_bytes::<u8>(tensor.to_vec1()?),
         DType::U32 => data_to_bytes::<u32>(tensor.to_vec1()?),
         DType::I64 => data_to_bytes::<i64>(tensor.to_vec1()?),
+        DType::I16 => data_to_bytes::<i16>(tensor.to_vec1()?),
+        DType::I32 => data_to_bytes::<i32>(tensor.to_vec1()?),
         DType::F16 => data_to_bytes::<half::f16>(tensor.to_vec1()?),
         DType::BF16 => data_to_bytes::<half::bf16>(tensor.to_vec1()?),
         DType::F32 => data_to_bytes::<f32>(tensor.to_vec1()?),
@@ -28,11 +30,13 @@ pub(crate) fn serialize_tensor(buffer: &mut Vec<u8>, tensor: &Tensor) -> Result<
     let dtype: u32 = match tensor.dtype() {
         DType::U8 => 0,
         DType::U32 => 1,
-        DType::I64 => 3,
-        DType::F16 => 4,
-        DType::BF16 => 5,
-        DType::F32 => 6,
-        DType::F64 => 7,
+        DType::I16 => 2,
+        DType::I32 => 3,
+        DType::I64 => 4,
+        DType::F16 => 5,
+        DType::BF16 => 6,
+        DType::F32 => 7,
+        DType::F64 => 8,
     };
     buffer.extend(&dtype.to_le_bytes());
 

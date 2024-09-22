@@ -41,7 +41,7 @@ const O_DIRECT: i32 = 0x4000; // Linux
 static CUDA_LIB: OnceLock<Lib> = OnceLock::new();
 pub fn get_cuda_lib() -> &'static Lib {
     CUDA_LIB.get_or_init(|| {
-        let cuda_path = OsStr::new("/usr/local/cuda/lib64/libcuda.so");
+        let cuda_path = OsStr::new("/usr/lib64/libcuda.so");
         unsafe { Lib::new(cuda_path).expect("Failed to load CUDA library") }
     })
 }
@@ -423,14 +423,14 @@ impl SafeTensorFile {
     }
 }
 
-pub fn safetensors_load(
+pub async fn safetensors_load(
     handle: &mut SafeTensorFile,
     target: &mut Vec<u8>,
     offset: usize,
     length: usize,
     device: &Device,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    Runtime::new()?.block_on(async {
-        handle.load(target, offset, length, device).await
-    })
+
+    handle.load(target, offset, length, device).await
+
 }
