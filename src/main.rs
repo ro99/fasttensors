@@ -71,13 +71,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let vec_fast = tensor_fast.to_vec1::<half::f16>()?;
                         let vec_slow = tensor_slow.to_vec1::<half::f16>()?;
 
-                        let slowwww = vec_slow.first().unwrap();
-                        let fastttt = vec_fast.first().unwrap();
-        
-                        println!("slowwww: {:?}, fastttt: {:?}", slowwww, fastttt);
-
-
-
                         if vec_fast != vec_slow {
                             println!("Vectors are different for key: {}", key);
                             return Err(std::io::Error::new(std::io::ErrorKind::Other, "Vectors are different").into());
@@ -88,13 +81,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     DType::I32 => {
                         let vec_fast = tensor_fast.to_vec1::<i32>()?;
                         let vec_slow = tensor_slow.to_vec1::<i32>()?;
-
-                        let slowwww = vec_slow.first().unwrap();
-                        let fastttt = vec_fast.first().unwrap();
-        
-                        println!("slowwww: {:?}, fastttt: {:?}", slowwww, fastttt);
-
-
 
                         if vec_fast != vec_slow {
                             println!("Vectors are different for key: {}", key);

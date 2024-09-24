@@ -142,8 +142,8 @@ impl<'a> Drop for GpuOpGuard<'a> {
 #[derive(Clone, Copy, Eq, Hash)]
 pub struct FileRange {
     file_descriptor: RawFd,
-    start: usize,
-    end: usize,
+    pub start: usize,
+    pub end: usize,
 }
 
 impl FileRange {
@@ -244,23 +244,25 @@ impl PinnedMemory {
     pub async fn read_page(
         file: &mut File,
         file_range: FileRange,
-        offset: usize,
         filesize: usize,
-    ) -> std::io::Result<usize> {
-        let FileRange { file_descriptor: _, start, end } = file_range;
-        let read_len = std::cmp::min(end - start, filesize - offset);
-
-        // Seek to the correct position in the file
-        file.seek(SeekFrom::Start(offset as u64)).await?;
-
+    ) -> Result<Arc<Page>, Box<dyn std::error::Error>> {
         if let Some(pages) = PAGES.get() {
-            if let Some(page) = pages.get(&file_range) {
-                let bytes_read = file.read(unsafe { std::slice::from_raw_parts_mut(page.ptr(), read_len) }).await?;
-                return Ok(bytes_read);
+            let (_, old_page) = pages.lru().unwrap();
+
+            let read_len = std::cmp::min(file_range.end - file_range.start, filesize - file_range.start);
+
+            file.seek(SeekFrom::Start(file_range.start as u64)).await?;
+            let bytes_read = file.read(unsafe { std::slice::from_raw_parts_mut(old_page.ptr(), read_len) }).await?;
+            if bytes_read == 0 {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("Reached EOF after reading {} of {} bytes", bytes_read, read_len)
+                )));
             }
+            PAGES.get().unwrap().insert(file_range, old_page.clone());
+            return Ok(old_page);
         }
-        Err(std::io::Error::new(std::io::ErrorKind::Other, "Page not found"))
- 
+        Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Page not found")))
     }
 
     pub async fn get_cache_page(
@@ -275,12 +277,7 @@ impl PinnedMemory {
         if let Some(page) = PAGES.get().unwrap().get(&file_range) {
             return Ok(page);
         }
-
-        let (_, page) = PAGES.get().unwrap().lru().unwrap();
-        PAGES.get().unwrap().insert(file_range, page.clone());
-
-
-        PinnedMemory::read_page(file, file_range, start_offset, filesize).await?;
+        let page = PinnedMemory::read_page(file, file_range, filesize).await?;
         Ok(page)
     }
 }
@@ -290,20 +287,6 @@ impl Drop for PinnedMemory {
         let pinned_buffer = PINNED_BUFFER.get().unwrap().load(std::sync::atomic::Ordering::SeqCst);
         if let Err(e) = free_pinned_memory(pinned_buffer) {
             eprintln!("Error freeing pinned memory: {:?}", e);
-        }
-    }
-}
-
-// Aligned buffer for direct I/O
-#[repr(align(4096))]
-struct AlignedBuffer {
-    buffer: Box<[u8]>,
-}
-
-impl AlignedBuffer {
-    fn new(size: usize) -> Self {
-        Self {
-            buffer: vec![0u8; size].into_boxed_slice(),
         }
     }
 }
