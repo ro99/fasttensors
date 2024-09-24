@@ -1,29 +1,31 @@
-use candle_core::{
-    cuda::cudarc::driver::{
-        sys::{CUresult, CUstream, Lib},
-        CudaStream,
-    },
-    quantized::QTensor,
-    Device, Tensor,
-};
-use io_uring::{opcode, types, IoUring};
+use candle_core::cuda::cudarc::driver::sys as cudarc_sys;
+use candle_core::cuda::cudarc::driver::DevicePtr;
 
+use candle_core::DType;
+use candle_core::Device;
+use candle_core::Storage;
+use candle_core::Tensor;
+use io_uring::{opcode, types, IoUring};
+use std::os::unix::io::AsRawFd;
+
+use std::cell::UnsafeCell;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io;
+use std::ops::Deref;
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
-    borrow::Borrow, ffi::OsStr, os::{
+    ffi::OsStr,
+    os::{
         raw::c_void,
-        unix::{
-            fs::MetadataExt,
-            io::{AsRawFd, RawFd},
-        },
-    }, path::{Path, PathBuf}, ptr::NonNull, sync::{
+        unix::io::RawFd,
+    },
+    path::Path,
+    ptr::NonNull,
+    sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, OnceLock,
-    }
-};
-use tokio::{
-    fs::{File, OpenOptions},
-    io,
-    runtime::Runtime,
+    },
 };
 
 use crate::{
@@ -38,17 +40,17 @@ const PAGE_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 const PINNED_MEMORY: usize = MAX_PAGES * PAGE_SIZE; // 64 MB
 const O_DIRECT: i32 = 0x4000; // Linux
 
-static CUDA_LIB: OnceLock<Lib> = OnceLock::new();
-pub fn get_cuda_lib() -> &'static Lib {
+static CUDA_LIB: OnceLock<cudarc_sys::Lib> = OnceLock::new();
+pub fn get_cuda_lib() -> &'static cudarc_sys::Lib {
     CUDA_LIB.get_or_init(|| {
         let cuda_path = OsStr::new("/usr/lib64/libcuda.so");
-        unsafe { Lib::new(cuda_path).expect("Failed to load CUDA library") }
+        unsafe { cudarc_sys::Lib::new(cuda_path).expect("Failed to load CUDA library") }
     })
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("CUDA error: {0:?}")]
-struct CudaError(CUresult);
+struct CudaError(cudarc_sys::CUresult);
 
 pub struct GpuOpCell {
     count: AtomicUsize,
@@ -95,19 +97,23 @@ impl CudaGpuOpCell {
 
     pub unsafe fn add_callback_to_stream(
         &self,
-        cuda_lib: &Lib,
-        stream: &CudaStream,
+        cuda_lib: &cudarc_sys::Lib,
+        stream: cudarc_sys::CUstream,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cell_clone = self.cell.clone();
 
-        extern "C" fn callback(_stream: CUstream, _status: CUresult, user_data: *mut c_void) {
+        extern "C" fn callback(
+            _stream: cudarc_sys::CUstream,
+            _status: cudarc_sys::CUresult,
+            user_data: *mut c_void,
+        ) {
             let cell = unsafe { &*(user_data as *const GpuOpCell) };
             cell.decrement();
         }
         let user_data = Arc::into_raw(cell_clone) as *mut c_void;
 
         cuda_lib
-            .cuStreamAddCallback(stream.stream, Some(callback), user_data, 0)
+            .cuStreamAddCallback(stream, Some(callback), user_data, 0)
             .result()?;
 
         Ok(())
@@ -174,22 +180,16 @@ impl PartialOrd for FileRange {
 }
 
 pub struct Page {
-    file_range: FileRange,
     gpu_op_cell: CudaGpuOpCell,
     ptr: NonNull<u8>,
 }
 
 impl Page {
-    pub fn new(fd: FileRange, ptr: NonNull<u8>) -> Self {
+    pub fn new(ptr: NonNull<u8>) -> Self {
         Page {
-            file_range: fd,
             gpu_op_cell: CudaGpuOpCell::new(),
             ptr,
         }
-    }
-
-    pub fn is_fd_assigned(&self) -> bool {
-        self.file_range.file_descriptor > 0
     }
 
     pub fn is_in_use(&self) -> bool {
@@ -198,10 +198,6 @@ impl Page {
 
     pub fn get_ptr(&self) -> NonNull<u8> {
         self.ptr
-    }
-
-    pub fn get_file_range(&self) -> &FileRange {
-        &self.file_range
     }
 }
 
@@ -212,13 +208,12 @@ type PageCache = Cache<FileRange, Page>;
 
 pub struct PinnedMemory {
     pinned_buffer: NonNull<u8>,
-    aligned_buffer: NonNull<u8>,
     pages: PageCache,
-    size: usize,
+    ring: UnsafeCell<IoUring>, // New field
 }
 
 impl PinnedMemory {
-    pub fn new() -> Result<Self, CUresult> {
+    pub fn new() -> Result<Self, cudarc_sys::CUresult> {
         let size = PINNED_MEMORY;
         let alignment = MAX_BLOCK_SIZE;
         let total_size = size + alignment;
@@ -234,19 +229,20 @@ impl PinnedMemory {
         for i in 0..MAX_PAGES {
             let fd = FileRange::new(-1 * i as i32, 0, 0);
             let page_ptr = unsafe { aligned_buffer.as_ptr().add(i * PAGE_SIZE) };
-            let page = Page::new(fd, NonNull::new(page_ptr).unwrap());
+            let page = Page::new(NonNull::new(page_ptr).unwrap());
             pages.insert(fd, page);
         }
 
+        let ring = IoUring::new(Q_DEPTH).expect("failed to create io_uring");
+
         Ok(PinnedMemory {
             pinned_buffer: NonNull::new(pinned_buffer).unwrap(),
-            aligned_buffer,
             pages,
-            size,
+            ring: UnsafeCell::new(ring),
         })
     }
 
-    pub async fn get_cache_page(
+    pub fn get_cache_page(
         &self,
         file: &mut File,
         filesize: usize,
@@ -262,11 +258,13 @@ impl PinnedMemory {
         }
 
         // If not in cache, we need to load it
-        let mut ring = IoUring::new(Q_DEPTH).expect("failed to create io_uring");
         let (_, old_page) = self.pages.pop_lru().expect("failed to pop lru");
         let page_ptr = old_page.get_ptr().as_ptr();
         let chunk_size = PAGE_SIZE / Q_DEPTH as usize;
         let mut current_offset = start_offset;
+
+        let ring = unsafe { &mut *self.ring.get() };
+        let mut num_chunks = 0;
 
         // Prepare read operations
         for chunk_index in 0..Q_DEPTH {
@@ -287,26 +285,17 @@ impl PinnedMemory {
                     .expect("failed to push read operation");
             }
 
+            num_chunks += 1;
             if next_offset >= filesize {
                 break;
             }
             current_offset = next_offset;
         }
 
-        // Submit and wait for completion
-        ring.submit_and_wait(Q_DEPTH as usize)?;
-
-        // Process completions
-        ring.completion().for_each(|cqe| {
-            if cqe.result() < 0 {
-                eprintln!(
-                    "Read error: {}",
-                    std::io::Error::from_raw_os_error(-cqe.result())
-                );
-            }
-        });
-
-        let page = Arc::new(Page::new(file_range, NonNull::new(page_ptr).unwrap()));
+        ring.submit_and_wait(num_chunks)?;
+        ring.completion().next().expect("completion queue is empty");
+        
+        let page = Arc::new(Page::new(NonNull::new(page_ptr).unwrap()));
 
         // Insert the updated page into the cache
         self.pages.insert(file_range, page.clone());
@@ -339,98 +328,80 @@ impl AlignedBuffer {
 pub struct SafeTensorFile {
     file: File,
     filesize: u64,
-    block_size: u64,
-    padded_size: u64,
 }
 
 impl SafeTensorFile {
-    pub async fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+    pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(O_DIRECT)
-            .open(path)
-            .await?;
+            .open(path)?;
 
-        let metadata = file.metadata().await?;
+        let metadata = file.metadata()?;
         let filesize = metadata.len();
-        let block_size = metadata.blksize();
-        let padded_size = (filesize + block_size - 1) / block_size;
 
         Ok(Self {
             file,
             filesize,
-            block_size,
-            padded_size,
         })
     }
-    pub async fn load(
+    pub fn load(
         &mut self,
-        target: &mut Vec<u8>,
+        tensor: &mut Tensor,
+        device: &Device,
         offset: usize,
         length: usize,
-        device: &Device,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        
+        let cuda_lib = get_cuda_lib();
 
         let pinned_memory = PinnedMemory::new().map_err(CudaError)?;
 
         let mut tensor_offset = 0;
         let mut file_b = offset / PAGE_SIZE * PAGE_SIZE;
 
+        let (storage, _) = tensor.storage_mut_and_layout();
+
+        let target = *match storage.deref() {
+            Storage::Cuda(cuda_storage) => match storage.dtype() {
+                DType::I32 => cuda_storage.as_cuda_slice::<i32>()?.device_ptr(),
+                DType::I16 => cuda_storage.as_cuda_slice::<i16>()?.device_ptr(),
+                DType::F16 => cuda_storage.as_cuda_slice::<half::f16>()?.device_ptr(),
+                DType::BF16 => cuda_storage.as_cuda_slice::<half::bf16>()?.device_ptr(),
+                DType::F32 => cuda_storage.as_cuda_slice::<f32>()?.device_ptr(),
+                DType::F64 => cuda_storage.as_cuda_slice::<f64>()?.device_ptr(),
+                _ => unimplemented!("unsupported data type"),
+            },
+            _ => unreachable!("unexpected storage type"),
+        } as *mut u8;
+
+        let default_stream = match device {
+            Device::Cuda(device) => device.cu_stream(),
+            _ => return Err("Unsupported device".into()),
+        };
+
         while tensor_offset < length {
             let file_a = file_b;
             file_b += PAGE_SIZE;
 
-            let page = pinned_memory
-                .get_cache_page(&mut self.file, self.filesize as usize, file_a, file_b)
-                .await?;
+            let page = pinned_memory.get_cache_page(&mut self.file, self.filesize as usize, file_a, file_b)?;
 
-            let left = (offset - file_a).max(0);
+            let left = offset.checked_sub(file_a).unwrap_or(0);
             let right = (offset + length - file_a).min(PAGE_SIZE);
             let copy_len = right - left;
 
             let src = unsafe { page.get_ptr().as_ptr().add(left) };
-            let dst = unsafe { target.as_mut_ptr().add(tensor_offset) };
+            let dst = unsafe { target.add(tensor_offset) };
 
             match device {
-                Device::Cpu => unsafe {
-                    std::ptr::copy_nonoverlapping(src, dst, copy_len);
-                },
-                Device::Cuda(_) => {
-                    let cuda_lib = get_cuda_lib();
-
-                    let stream = match device {
-                        Device::Cuda(device) => device.cuda_device().fork_default_stream()?,
-                        _ => return Err("Unsupported device".into()),
-                    };
-                    unsafe {
-                        cuda_lib
-                            .cuMemcpyAsync(dst as u64, src as u64, copy_len, stream.stream)
-                            .result()?;
-                    }
+                Device::Cuda(_) => unsafe {
+                    cuda_lib.cuMemcpyAsync(dst as u64, src as u64, copy_len, *default_stream).result()?;
                     page.gpu_op_cell.increment();
-                    unsafe {
-                        page.gpu_op_cell.add_callback_to_stream(cuda_lib, &stream)?;
-                    }
-                }
+                    page.gpu_op_cell.add_callback_to_stream(cuda_lib, *default_stream)?;
+                },
                 _ => return Err("Unsupported device".into()),
             }
-
             tensor_offset += copy_len;
         }
-
         Ok(())
     }
-}
-
-pub async fn safetensors_load(
-    handle: &mut SafeTensorFile,
-    target: &mut Vec<u8>,
-    offset: usize,
-    length: usize,
-    device: &Device,
-) -> Result<(), Box<dyn std::error::Error>> {
-
-    handle.load(target, offset, length, device).await
-
 }

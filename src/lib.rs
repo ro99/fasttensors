@@ -1,7 +1,6 @@
 use cache::Cache;
 use candle_core::{safetensors as sf, DType, Device, DeviceLocation, Tensor};
-use half::{bf16, f16};
-use mem::{safetensors_load, SafeTensorFile};
+use mem::SafeTensorFile;
 use memmap2::Mmap;
 use safetensors::tensor::SafeTensorError;
 use serde_json::Value;
@@ -9,13 +8,11 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
-use utils::serialize_tensor;
 
 //mod config;
 mod cache;
 mod mem;
 mod op;
-mod utils;
 
 const MAX_BLOCK_SIZE: usize = 128 * 1024;
 const MAX_PAGES: usize = 4;
@@ -75,7 +72,7 @@ pub(crate) static CONTEXT_CACHE: OnceLock<ContextCache> = OnceLock::new();
 pub(crate) static STFILE_CACHE: OnceLock<STFileCache> = OnceLock::new();
 
 // Initialize the caches
-pub(crate) fn init_caches() {
+pub fn init_caches() {
     TENSOR_CACHE.get_or_init(|| TensorCache::new(TENSOR_CACHE_CAPACITY));
     CONTEXT_CACHE.get_or_init(|| ContextCache::new(CONTEXT_CACHE_CAPACITY));
     STFILE_CACHE.get_or_init(|| STFileCache::new(STFILE_CACHE_CAPACITY));
@@ -92,7 +89,7 @@ pub struct FastTensorFile {
 }
 
 impl FastTensorFile {
-    pub async fn open<P: AsRef<Path>>(
+    pub fn new<P: AsRef<Path>>(
         filename: P,
         fast: bool,
         keymap: Option<Vec<(String, String)>>,
@@ -142,7 +139,7 @@ impl FastTensorFile {
             remap
         });
 
-        let file = SafeTensorFile::new(filename_str.clone()).await?;
+        let file = SafeTensorFile::new(filename_str.clone())?;
 
         let stfile = Arc::new(Self {
             filename: filename_str.clone(),
@@ -167,6 +164,10 @@ impl FastTensorFile {
         if self.fast {}
 
         Ok(())
+    }
+
+    pub fn get_keys(&self) -> Vec<String> {
+        self.header.as_object().unwrap().keys().cloned().collect()
     }
 
     pub fn get_dict(&self) -> &serde_json::Value {
@@ -204,7 +205,7 @@ impl FastTensorFile {
         Ok(end - start)
     }
 
-    pub async fn get_tensor(
+    pub fn get_tensor(
         &self,
         key: &String,
         device: &Device,
@@ -232,9 +233,9 @@ impl FastTensorFile {
         }
 
         let tensor = if not_fast {
-            self.load_tensor_slow(key, device).await?
+            self.load_tensor_slow(key, device)?
         } else {
-            self.load_tensor_fast(key, device).await?
+            self.load_tensor_fast(key, device)?
         };
 
         let tensor = Arc::new(tensor);
@@ -247,7 +248,7 @@ impl FastTensorFile {
         Ok(tensor)
     }
 
-    async fn load_tensor_slow(
+    fn load_tensor_slow(
         &self,
         key: &str,
         device: &Device,
@@ -282,7 +283,7 @@ impl FastTensorFile {
         Ok(tensor.clone())
     }
 
-    async fn load_tensor_fast(
+    fn load_tensor_fast(
         &self,
         key: &str,
         device: &Device,
@@ -304,22 +305,20 @@ impl FastTensorFile {
         let end_offset = data_offsets[1].as_u64().unwrap() as usize;
         let length = end_offset - start_offset;
 
-        let tensor = Tensor::zeros(shape, dtype, device)?;
-        let mut target: Vec<u8> = Vec::new();
-
-        serialize_tensor(&mut target, &tensor)?;
-
-        safetensors_load(
-            &mut *self.file_handle.lock().unwrap(),
-            &mut target,
-            start_offset + self.header_size,
-            length,
-            device,
-        )
-        .await.map_err(|e| {
-            FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(e.to_string()))
-        })?;
-
+        let shape_product: usize = shape.iter().product();
+        let dtype_size = dtype.size_in_bytes();
+        if shape_product * dtype_size != length {
+            return Err(FastTensorsError::InvalidData(format!(
+                "Tensor shape doesn't match storage size: {}",
+                key
+            )));
+        }
+        let mut tensor = Tensor::zeros(shape, dtype, device)?;
+        let offset = start_offset + self.header_size;
+        self.file_handle.lock().unwrap().load(&mut tensor, device, offset, length)
+            .map_err(|e| {
+                FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(e.to_string()))
+            })?;
         Ok(tensor)
     }
 }
@@ -354,51 +353,5 @@ impl Drop for FastTensorFile {
         if let Err(e) = self.close() {
             eprintln!("Error during FastTensorFile cleanup: {:?}", e);
         }
-    }
-}
-
-//let header_json = std::str::from_utf8(&mmap[8..8 + header_size]).unwrap();
-//let mut header: Value = serde_json::from_str(header_json)?;
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use candle_core::Device;
-    use std::path::PathBuf;
-
-
-    #[tokio::test]
-    async fn test_fast_tensor_file_comparison() -> Result<(), FastTensorsError> {
-        // Initialize caches
-        init_caches();
-
-        // Create a test safetensors file path
-        let test_file = PathBuf::from("/home/rodrigo/AI/Models/Exllama/Mistral-Nemo-12B/Lumimaid-v0.2-12B-8.0bpw-h8-exl2-rpcal/output-00001-of-00002.safetensors");
-
-        // Open the FastTensorFile
-        let fast_tensor_file = FastTensorFile::open(&test_file, true, None).await?;
-
-        // Test key
-        let key = "model.layers.11.self_attn.o_proj.q_weight";
-        println!("Testing key: {}", key);
-
-        // Get CUDA device (assuming CUDA is available, otherwise use CPU)
-        let device = Device::cuda_if_available(0)?;
-
-        // Get tensor using fast method
-        let tensor_fast = fast_tensor_file
-            .get_tensor(&key.to_string(), &device, false, None)
-            .await?;
-
-        // Get tensor using slow method
-        let tensor_slow = fast_tensor_file
-            .get_tensor(&key.to_string(), &device, true, None)
-            .await?;
-
-        // Cleanup
-        cleanup();
-
-        Ok(())
     }
 }
