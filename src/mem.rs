@@ -5,12 +5,13 @@ use candle_core::DType;
 use candle_core::Device;
 use candle_core::Storage;
 use candle_core::Tensor;
-use io_uring::{opcode, types, IoUring};
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncSeekExt;
+use std::io::SeekFrom;
 use std::os::unix::io::AsRawFd;
 
-use std::cell::UnsafeCell;
-use std::fs::File;
-use std::fs::OpenOptions;
+use tokio::fs::File;
 use std::io;
 use std::ops::Deref;
 use std::os::unix::fs::OpenOptionsExt;
@@ -209,7 +210,6 @@ type PageCache = Cache<FileRange, Page>;
 pub struct PinnedMemory {
     pinned_buffer: NonNull<u8>,
     pages: PageCache,
-    ring: UnsafeCell<IoUring>, // New field
 }
 
 impl PinnedMemory {
@@ -233,16 +233,31 @@ impl PinnedMemory {
             pages.insert(fd, page);
         }
 
-        let ring = IoUring::new(Q_DEPTH).expect("failed to create io_uring");
-
         Ok(PinnedMemory {
             pinned_buffer: NonNull::new(pinned_buffer).unwrap(),
             pages,
-            ring: UnsafeCell::new(ring),
         })
     }
 
-    pub fn get_cache_page(
+    async fn read_page(&self, file: &mut File, page_ptr: *mut u8, offset: usize, filesize: usize) -> std::io::Result<usize> {
+        let remaining_bytes = filesize.saturating_sub(offset);
+        let read_len = remaining_bytes.min(PAGE_SIZE);
+        let page_slice = unsafe { std::slice::from_raw_parts_mut(page_ptr, read_len) };
+        
+        file.seek(SeekFrom::Start(offset as u64)).await?;
+        let bytes_read = file.read_exact(page_slice).await?;
+
+        if bytes_read != read_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("Incomplete read: expected {}, got {}", read_len, bytes_read),
+            ));
+        }
+
+        Ok(bytes_read)
+    }
+
+    pub async fn get_cache_page(
         &self,
         file: &mut File,
         filesize: usize,
@@ -252,52 +267,15 @@ impl PinnedMemory {
         let file_descriptor = file.as_raw_fd();
         let file_range = FileRange::new(file_descriptor, start_offset, end_offset);
 
-        // Check if the page is already in cache
         if let Some(page) = self.pages.get(&file_range) {
             return Ok(page);
         }
-
-        // If not in cache, we need to load it
         let (_, old_page) = self.pages.pop_lru().expect("failed to pop lru");
         let page_ptr = old_page.get_ptr().as_ptr();
-        let chunk_size = PAGE_SIZE / Q_DEPTH as usize;
-        let mut current_offset = start_offset;
 
-        let ring = unsafe { &mut *self.ring.get() };
-        let mut num_chunks = 0;
+        self.read_page(file, page_ptr, start_offset, filesize).await?;
 
-        // Prepare read operations
-        for chunk_index in 0..Q_DEPTH {
-            let next_offset = (current_offset + chunk_size).min(filesize);
-            let read_size = next_offset - current_offset;
-
-            let read_op = opcode::Read::new(
-                types::Fd(file_descriptor),
-                unsafe { page_ptr.add(chunk_index as usize * chunk_size) },
-                read_size as _,
-            )
-            .offset(current_offset as _)
-            .build();
-
-            unsafe {
-                ring.submission()
-                    .push(&read_op)
-                    .expect("failed to push read operation");
-            }
-
-            num_chunks += 1;
-            if next_offset >= filesize {
-                break;
-            }
-            current_offset = next_offset;
-        }
-
-        ring.submit_and_wait(num_chunks)?;
-        ring.completion().next().expect("completion queue is empty");
-        
         let page = Arc::new(Page::new(NonNull::new(page_ptr).unwrap()));
-
-        // Insert the updated page into the cache
         self.pages.insert(file_range, page.clone());
         Ok(page)
     }
@@ -331,21 +309,15 @@ pub struct SafeTensorFile {
 }
 
 impl SafeTensorFile {
-    pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(O_DIRECT)
-            .open(path)?;
-
-        let metadata = file.metadata()?;
+    pub async fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).custom_flags(O_DIRECT).open(path).await?;
+        let metadata = file.metadata().await?;
         let filesize = metadata.len();
 
-        Ok(Self {
-            file,
-            filesize,
-        })
+        Ok(Self { file, filesize })
     }
-    pub fn load(
+    
+    pub async fn load(
         &mut self,
         tensor: &mut Tensor,
         device: &Device,
@@ -359,21 +331,7 @@ impl SafeTensorFile {
         let mut tensor_offset = 0;
         let mut file_b = offset / PAGE_SIZE * PAGE_SIZE;
 
-        let (storage, _) = tensor.storage_mut_and_layout();
-
-        let target = *match storage.deref() {
-            Storage::Cuda(cuda_storage) => match storage.dtype() {
-                DType::I32 => cuda_storage.as_cuda_slice::<i32>()?.device_ptr(),
-                DType::I16 => cuda_storage.as_cuda_slice::<i16>()?.device_ptr(),
-                DType::F16 => cuda_storage.as_cuda_slice::<half::f16>()?.device_ptr(),
-                DType::BF16 => cuda_storage.as_cuda_slice::<half::bf16>()?.device_ptr(),
-                DType::F32 => cuda_storage.as_cuda_slice::<f32>()?.device_ptr(),
-                DType::F64 => cuda_storage.as_cuda_slice::<f64>()?.device_ptr(),
-                _ => unimplemented!("unsupported data type"),
-            },
-            _ => unreachable!("unexpected storage type"),
-        } as *mut u8;
-
+        let target = get_raw_tensor_ptr(tensor)?;
         let default_stream = match device {
             Device::Cuda(device) => device.cu_stream(),
             _ => return Err("Unsupported device".into()),
@@ -383,7 +341,7 @@ impl SafeTensorFile {
             let file_a = file_b;
             file_b += PAGE_SIZE;
 
-            let page = pinned_memory.get_cache_page(&mut self.file, self.filesize as usize, file_a, file_b)?;
+            let page = pinned_memory.get_cache_page(&mut self.file, self.filesize as usize, file_a, file_b).await?;
 
             let left = offset.checked_sub(file_a).unwrap_or(0);
             let right = (offset + length - file_a).min(PAGE_SIZE);
@@ -404,4 +362,23 @@ impl SafeTensorFile {
         }
         Ok(())
     }
+}
+
+fn get_raw_tensor_ptr(tensor: &mut Tensor) -> Result<*mut u8, Box<dyn std::error::Error>> {
+    let (storage, _) = tensor.storage_mut_and_layout();
+
+    let target = *match storage.deref() {
+        Storage::Cuda(cuda_storage) => match storage.dtype() {
+            DType::I32 => cuda_storage.as_cuda_slice::<i32>()?.device_ptr(),
+            DType::I16 => cuda_storage.as_cuda_slice::<i16>()?.device_ptr(),
+            DType::F16 => cuda_storage.as_cuda_slice::<half::f16>()?.device_ptr(),
+            DType::BF16 => cuda_storage.as_cuda_slice::<half::bf16>()?.device_ptr(),
+            DType::F32 => cuda_storage.as_cuda_slice::<f32>()?.device_ptr(),
+            DType::F64 => cuda_storage.as_cuda_slice::<f64>()?.device_ptr(),
+            _ => return Err("unsupported data type".into()),
+        },
+        _ => return Err("unexpected storage type".into()),
+    } as *mut u8;
+
+    Ok(target)
 }

@@ -89,7 +89,7 @@ pub struct FastTensorFile {
 }
 
 impl FastTensorFile {
-    pub fn new<P: AsRef<Path>>(
+    pub async fn new<P: AsRef<Path>>(
         filename: P,
         fast: bool,
         keymap: Option<Vec<(String, String)>>,
@@ -139,7 +139,7 @@ impl FastTensorFile {
             remap
         });
 
-        let file = SafeTensorFile::new(filename_str.clone())?;
+        let file = SafeTensorFile::new(filename_str.clone()).await?;
 
         let stfile = Arc::new(Self {
             filename: filename_str.clone(),
@@ -205,7 +205,7 @@ impl FastTensorFile {
         Ok(end - start)
     }
 
-    pub fn get_tensor(
+    pub async fn get_tensor(
         &self,
         key: &String,
         device: &Device,
@@ -235,7 +235,7 @@ impl FastTensorFile {
         let tensor = if not_fast {
             self.load_tensor_slow(key, device)?
         } else {
-            self.load_tensor_fast(key, device)?
+            self.load_tensor_fast(key, device).await?
         };
 
         let tensor = Arc::new(tensor);
@@ -283,7 +283,7 @@ impl FastTensorFile {
         Ok(tensor.clone())
     }
 
-    fn load_tensor_fast(
+    async fn load_tensor_fast(
         &self,
         key: &str,
         device: &Device,
@@ -291,7 +291,6 @@ impl FastTensorFile {
         let header_info = self.header.get(key).ok_or_else(|| {
             FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string()))
         })?;
-
         let dtype = convert_dtype(&header_info["dtype"].as_str().unwrap())?;
         let shape: Vec<usize> = header_info["shape"]
             .as_array()
@@ -299,11 +298,9 @@ impl FastTensorFile {
             .iter()
             .map(|v| v.as_u64().unwrap() as usize)
             .collect();
-
         let data_offsets = header_info["data_offsets"].as_array().unwrap();
-        let start_offset = data_offsets[0].as_u64().unwrap() as usize;
-        let end_offset = data_offsets[1].as_u64().unwrap() as usize;
-        let length = end_offset - start_offset;
+        let offset = data_offsets[0].as_u64().unwrap() as usize + self.header_size;
+        let length = (data_offsets[1].as_u64().unwrap() - data_offsets[0].as_u64().unwrap()) as usize;
 
         let shape_product: usize = shape.iter().product();
         let dtype_size = dtype.size_in_bytes();
@@ -314,9 +311,8 @@ impl FastTensorFile {
             )));
         }
         let mut tensor = Tensor::zeros(shape, dtype, device)?;
-        let offset = start_offset + self.header_size;
         self.file_handle.lock().unwrap().load(&mut tensor, device, offset, length)
-            .map_err(|e| {
+            .await.map_err(|e| {
                 FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(e.to_string()))
             })?;
         Ok(tensor)
@@ -325,12 +321,12 @@ impl FastTensorFile {
 
 pub fn convert_dtype(dt: &str) -> Result<DType, FastTensorsError> {
     match dt {
-        "I32" => Ok(DType::I32),
-        "I16" => Ok(DType::I16),
-        "F16" => Ok(DType::F16),
+        "I32"  => Ok(DType::I32),
+        "I16"  => Ok(DType::I16),
+        "F16"  => Ok(DType::F16),
         "BF16" => Ok(DType::BF16),
-        "F32" => Ok(DType::F32),
-        _ => Err(FastTensorsError::UnknownDtype(dt.to_string())),
+        "F32"  => Ok(DType::F32),
+        _      => Err(FastTensorsError::UnknownDtype(dt.to_string())),
     }
 }
 
