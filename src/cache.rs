@@ -31,9 +31,14 @@ where
         cache.put(key, value);
     }
 
-    pub fn pop_lru(&self) -> Option<(K, Arc<T>)> {
+    pub fn lru(&self) -> Option<(K, Arc<T>)> {
         let mut cache = self.cache.lock().unwrap();
         cache.pop_lru().map(|(k, v)| (k, v.clone()))
+    }
+
+    pub fn contains_key(&self, key: &K) -> bool {
+        let cache = self.cache.lock().unwrap();
+        cache.contains(key)
     }
 
     pub fn remove(&self, key: &K) -> Option<Arc<T>> {
@@ -46,7 +51,3 @@ where
         cache.clear();
     }
 }
-
-
-
-

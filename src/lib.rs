@@ -94,6 +94,7 @@ impl FastTensorFile {
         fast: bool,
         keymap: Option<Vec<(String, String)>>,
     ) -> Result<Arc<Self>, FastTensorsError> {
+
         // Check if the file is already in the cache
         let filename_str = filename.as_ref().to_string_lossy().into_owned();
         if let Some(cached_file) = STFILE_CACHE.get().unwrap().get(&filename_str) {
@@ -167,9 +168,14 @@ impl FastTensorFile {
     }
 
     pub fn get_keys(&self) -> Vec<String> {
-        self.header.as_object().unwrap().keys().cloned().collect()
+        let mut keys: Vec<String> = self.header.as_object().unwrap().keys().cloned().collect();
+        keys.sort_by(|a, b| {
+            let a_offset = self.header[a]["data_offsets"][0].as_u64().unwrap();
+            let b_offset = self.header[b]["data_offsets"][0].as_u64().unwrap();
+            a_offset.cmp(&b_offset)
+        });
+        keys
     }
-
     pub fn get_dict(&self) -> &serde_json::Value {
         &self.header
     }
@@ -229,14 +235,18 @@ impl FastTensorFile {
         let cache_key = format!("{}::{}::{}", self.filename, key, device_id);
 
         if let Some(cached_tensor) = TENSOR_CACHE.get().unwrap().get(&cache_key) {
-            return Ok(cached_tensor);
+            return Ok(cached_tensor.clone());
         }
 
-        let tensor = if not_fast {
+        let mut tensor = if not_fast {
             self.load_tensor_slow(key, device)?
         } else {
             self.load_tensor_fast(key, device).await?
         };
+
+        if let Some(out_dtype) = out_dtype {
+            tensor = tensor.to_dtype(out_dtype)?;
+        }
 
         let tensor = Arc::new(tensor);
 
@@ -252,7 +262,7 @@ impl FastTensorFile {
         &self,
         key: &str,
         device: &Device,
-    ) -> Result<Tensor, FastTensorsError> {
+    ) -> Result<Tensor, FastTensorsError> { 
         let device_id = match device.location() {
             DeviceLocation::Cpu => "cpu".to_string(),
             DeviceLocation::Cuda { gpu_id } => format!("cuda:{}", gpu_id),
@@ -271,10 +281,8 @@ impl FastTensorFile {
         let context = sf::load(&self.filename, device).map_err(|_| {
             FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string()))
         })?;
-        CONTEXT_CACHE
-            .get()
-            .unwrap()
-            .insert(cache_key, context.clone());
+
+        CONTEXT_CACHE.get().unwrap().insert(cache_key, context.clone());
 
         let tensor = context.get(key).ok_or_else(|| {
             FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string()))
@@ -299,7 +307,7 @@ impl FastTensorFile {
             .map(|v| v.as_u64().unwrap() as usize)
             .collect();
         let data_offsets = header_info["data_offsets"].as_array().unwrap();
-        let offset = data_offsets[0].as_u64().unwrap() as usize + self.header_size;
+        let offset = data_offsets[0].as_u64().unwrap() as usize + self.header_size + 8; // Add 8 to account for the header size bytes
         let length = (data_offsets[1].as_u64().unwrap() - data_offsets[0].as_u64().unwrap()) as usize;
 
         let shape_product: usize = shape.iter().product();
@@ -349,5 +357,40 @@ impl Drop for FastTensorFile {
         if let Err(e) = self.close() {
             eprintln!("Error during FastTensorFile cleanup: {:?}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    #[tokio::test]
+    async fn test_fast_mode_first_key() -> Result<(), FastTensorsError> {
+        // Initialize caches
+        init_caches();
+
+        // Path to your safetensors file
+        let model_path = "/home/rodrigo/AI/Models/Exllama/Cohere-Aya23-35B/Cohere-aya-23-35B-8.0bpw-h8-exl2/output-00001-of-00005.safetensors";
+
+        // Create a FastTensorFile instance in fast mode
+        let fast_tensor_file = FastTensorFile::new(model_path, true, None).await?;
+
+        // Get the first key
+        let first_key = fast_tensor_file.get_keys().first().unwrap().clone();
+
+        // Get the tensor for the first key using fast mode
+        let device = Device::cuda_if_available(0)?;
+
+        let tensor = fast_tensor_file.get_tensor(&first_key, &device, false, None).await?;
+
+        // Check if the first value is 4643
+        let first_value = tensor.to_vec1::<i32>()?[0];
+        assert_eq!(first_value, 4643, "The first value should be 4643");
+
+        // Cleanup
+        cleanup();
+
+        Ok(())
     }
 }

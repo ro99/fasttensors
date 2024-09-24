@@ -3,6 +3,7 @@ use candle_core::Device;
 use fasttensors::{cleanup, init_caches, FastTensorFile};
 use std::time::Instant;
 use std::collections::HashMap;
+use candle_core::DType;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -41,7 +42,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let duration_fast = start_fast.elapsed();
             println!("Total fast method took: {:?}", duration_fast);
 
-
             let start_slow = Instant::now();
             for key in &keys {
                 let tensor = fast_tensor_file.get_tensor(key, &device, true, None).await?;
@@ -53,14 +53,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for key in keys {
                 let tensor_fast = tensors1.get(&key).unwrap();
                 let tensor_slow = tensors2.get(&key).unwrap();
-                let vec_fast = tensor_fast.to_vec2::<half::f16>()?;
-                let vec_slow = tensor_slow.to_vec2::<half::f16>()?;
 
-                if vec_fast != vec_slow {
-                    println!("Vectors are different for key: {}", key);
-                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "Vectors are different").into());
-                } else {
-                    println!("Vectors are the same for key: {}", key);
+                // Check the dtype and shape of the tensors
+                let dtype_fast = tensor_fast.dtype();
+                let dtype_slow = tensor_slow.dtype();
+                let shape_fast = tensor_fast.shape();
+                let shape_slow = tensor_slow.shape();
+
+                if dtype_fast != dtype_slow || shape_fast != shape_slow {
+                    println!("Tensors have different dtypes or shapes for key: {}", key);
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "Tensors have different dtypes or shapes").into());
+                }
+
+                // Convert tensors to vectors based on dtype
+                match dtype_fast {
+                    DType::F16 => {
+                        let vec_fast = tensor_fast.to_vec1::<half::f16>()?;
+                        let vec_slow = tensor_slow.to_vec1::<half::f16>()?;
+
+                        let slowwww = vec_slow.first().unwrap();
+                        let fastttt = vec_fast.first().unwrap();
+        
+                        println!("slowwww: {:?}, fastttt: {:?}", slowwww, fastttt);
+
+
+
+                        if vec_fast != vec_slow {
+                            println!("Vectors are different for key: {}", key);
+                            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Vectors are different").into());
+                        } else {
+                            println!("Vectors are the same for key: {}", key);
+                        }
+                    },
+                    DType::I32 => {
+                        let vec_fast = tensor_fast.to_vec1::<i32>()?;
+                        let vec_slow = tensor_slow.to_vec1::<i32>()?;
+
+                        let slowwww = vec_slow.first().unwrap();
+                        let fastttt = vec_fast.first().unwrap();
+        
+                        println!("slowwww: {:?}, fastttt: {:?}", slowwww, fastttt);
+
+
+
+                        if vec_fast != vec_slow {
+                            println!("Vectors are different for key: {}", key);
+                            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Vectors are different").into());
+                        } else {
+                            println!("Vectors are the same for key: {}", key);
+                        }
+                    },
+                    // Add more cases as needed for other dtypes
+                    _ => {
+                        println!("Unsupported dtype for key: {}", key);
+                        return Err(std::io::Error::new(std::io::ErrorKind::Other, "Unsupported dtype").into());
+                    }
                 }
             }
             println!("Finished benchmarking file: {}", stfile);
