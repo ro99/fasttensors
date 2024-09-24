@@ -58,6 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if vec_fast != vec_slow {
                     println!("Vectors are different for key: {}", key);
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "Vectors are different").into());
                 } else {
                     println!("Vectors are the same for key: {}", key);
                 }

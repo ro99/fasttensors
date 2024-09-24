@@ -5,29 +5,27 @@ use candle_core::DType;
 use candle_core::Device;
 use candle_core::Storage;
 use candle_core::Tensor;
+use std::io::SeekFrom;
+use std::os::unix::io::AsRawFd;
+use std::sync::{Arc, RwLock};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncSeekExt;
-use std::io::SeekFrom;
-use std::os::unix::io::AsRawFd;
 
-use tokio::fs::File;
 use std::io;
 use std::ops::Deref;
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
     ffi::OsStr,
-    os::{
-        raw::c_void,
-        unix::io::RawFd,
-    },
+    os::{raw::c_void, unix::io::RawFd},
     path::Path,
     ptr::NonNull,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, OnceLock,
+        OnceLock,
     },
 };
+use tokio::fs::File;
 
 use crate::{
     cache::Cache,
@@ -182,6 +180,8 @@ impl PartialOrd for FileRange {
 
 pub struct Page {
     gpu_op_cell: CudaGpuOpCell,
+    file_range: FileRange,
+    access: isize,
     ptr: NonNull<u8>,
 }
 
@@ -189,6 +189,8 @@ impl Page {
     pub fn new(ptr: NonNull<u8>) -> Self {
         Page {
             gpu_op_cell: CudaGpuOpCell::new(),
+            file_range: FileRange::new(-1, 0, 0),
+            access: -1,
             ptr,
         }
     }
@@ -205,11 +207,10 @@ impl Page {
 unsafe impl Send for Page {}
 unsafe impl Sync for Page {}
 
-type PageCache = Cache<FileRange, Page>;
-
 pub struct PinnedMemory {
     pinned_buffer: NonNull<u8>,
-    pages: PageCache,
+    pages: Vec<Page>,
+    serial: u64,
 }
 
 impl PinnedMemory {
@@ -223,29 +224,36 @@ impl PinnedMemory {
         let aligned = (pinned_buffer as usize + alignment - 1) & !(alignment - 1);
         let aligned_buffer = NonNull::new(aligned as *mut u8).unwrap();
 
-        let pages = PageCache::new(MAX_PAGES);
+        let mut pages = Vec::with_capacity(MAX_PAGES);
 
         // Initialize pages
         for i in 0..MAX_PAGES {
-            let fd = FileRange::new(-1 * i as i32, 0, 0);
             let page_ptr = unsafe { aligned_buffer.as_ptr().add(i * PAGE_SIZE) };
             let page = Page::new(NonNull::new(page_ptr).unwrap());
-            pages.insert(fd, page);
+            pages.push(page);
         }
 
         Ok(PinnedMemory {
+            serial: 1,
             pinned_buffer: NonNull::new(pinned_buffer).unwrap(),
             pages,
         })
     }
 
-    async fn read_page(&self, file: &mut File, page_ptr: *mut u8, offset: usize, filesize: usize) -> std::io::Result<usize> {
+    async fn read_page(
+        &self,
+        file: &mut File,
+        page_ptr: *mut u8,
+        offset: usize,
+        filesize: usize,
+    ) -> std::io::Result<usize> {
         let remaining_bytes = filesize.saturating_sub(offset);
         let read_len = remaining_bytes.min(PAGE_SIZE);
-        let page_slice = unsafe { std::slice::from_raw_parts_mut(page_ptr, read_len) };
-        
+
+        let mut aligned_buffer = AlignedBuffer::new(read_len);
+
         file.seek(SeekFrom::Start(offset as u64)).await?;
-        let bytes_read = file.read_exact(page_slice).await?;
+        let bytes_read = file.read_exact(&mut aligned_buffer.buffer).await?;
 
         if bytes_read != read_len {
             return Err(std::io::Error::new(
@@ -254,30 +262,70 @@ impl PinnedMemory {
             ));
         }
 
+        unsafe {
+            std::ptr::copy_nonoverlapping(aligned_buffer.buffer.as_ptr(), page_ptr, read_len);
+        }
+
         Ok(bytes_read)
     }
 
+    fn find_page(&mut self, file_descriptor: RawFd, file_a: usize, file_b: usize) -> Option<usize> {
+        let file_range = FileRange::new(file_descriptor, file_a, file_b);
+        for (index, page) in self.pages.iter_mut().enumerate() {
+            if page.file_range == file_range {
+                page.access = self.serial as isize;
+                self.serial += 1;
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    fn evict_page(&mut self, file_descriptor: RawFd, file_a: usize, file_b: usize) -> usize {
+        let mut oldest_i: Option<usize> = None;
+        let mut oldest = std::isize::MAX;
+
+        while oldest_i.is_none() {
+            for (i, page) in self.pages.iter_mut().enumerate() {
+                if page.is_in_use() {
+                    continue;
+                }
+                if page.access < oldest {
+                    oldest_i = Some(i);
+                    oldest = page.access;
+                }
+            }
+        }
+
+        let p = oldest_i.expect("No page found to evict");
+
+        self.pages[p].access = self.serial as isize;
+        self.serial += 1;
+        self.pages[p].file_range.start = file_a;
+        self.pages[p].file_range.end = file_b;
+        self.pages[p].file_range.file_descriptor = file_descriptor;
+
+        p
+    }
+
     pub async fn get_cache_page(
-        &self,
+        &mut self,
         file: &mut File,
         filesize: usize,
         start_offset: usize,
         end_offset: usize,
-    ) -> Result<Arc<Page>, Box<dyn std::error::Error>> {
+    ) -> Result<usize, Box<dyn std::error::Error>> {
         let file_descriptor = file.as_raw_fd();
-        let file_range = FileRange::new(file_descriptor, start_offset, end_offset);
 
-        if let Some(page) = self.pages.get(&file_range) {
-            return Ok(page);
+        if let Some(page_index) = self.find_page(file_descriptor, start_offset, end_offset) {
+            return Ok(page_index);
         }
-        let (_, old_page) = self.pages.pop_lru().expect("failed to pop lru");
-        let page_ptr = old_page.get_ptr().as_ptr();
 
-        self.read_page(file, page_ptr, start_offset, filesize).await?;
+        let page_index = self.evict_page(file_descriptor, start_offset, end_offset);
+        let page = &self.pages[page_index];
+        self.read_page(file, page.get_ptr().as_ptr(), start_offset, filesize).await?;
+        Ok(page_index)
 
-        let page = Arc::new(Page::new(NonNull::new(page_ptr).unwrap()));
-        self.pages.insert(file_range, page.clone());
-        Ok(page)
     }
 }
 
@@ -310,13 +358,17 @@ pub struct SafeTensorFile {
 
 impl SafeTensorFile {
     pub async fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).custom_flags(O_DIRECT).open(path).await?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECT)
+            .open(path)
+            .await?;
         let metadata = file.metadata().await?;
         let filesize = metadata.len();
 
         Ok(Self { file, filesize })
     }
-    
+
     pub async fn load(
         &mut self,
         tensor: &mut Tensor,
@@ -326,8 +378,7 @@ impl SafeTensorFile {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cuda_lib = get_cuda_lib();
 
-        let pinned_memory = PinnedMemory::new().map_err(CudaError)?;
-
+        let mut pinned_memory = PinnedMemory::new().map_err(CudaError)?;
         let mut tensor_offset = 0;
         let mut file_b = offset / PAGE_SIZE * PAGE_SIZE;
 
@@ -341,7 +392,9 @@ impl SafeTensorFile {
             let file_a = file_b;
             file_b += PAGE_SIZE;
 
-            let page = pinned_memory.get_cache_page(&mut self.file, self.filesize as usize, file_a, file_b).await?;
+            let page_index = &pinned_memory.get_cache_page(&mut self.file, self.filesize as usize, file_a, file_b).await?;
+
+            let page = &pinned_memory.pages[*page_index];
 
             let left = offset.checked_sub(file_a).unwrap_or(0);
             let right = (offset + length - file_a).min(PAGE_SIZE);
@@ -352,9 +405,12 @@ impl SafeTensorFile {
 
             match device {
                 Device::Cuda(_) => unsafe {
-                    cuda_lib.cuMemcpyAsync(dst as u64, src as u64, copy_len, *default_stream).result()?;
+                    cuda_lib
+                        .cuMemcpyAsync(dst as u64, src as u64, copy_len, *default_stream)
+                        .result()?;
                     page.gpu_op_cell.increment();
-                    page.gpu_op_cell.add_callback_to_stream(cuda_lib, *default_stream)?;
+                    page.gpu_op_cell
+                        .add_callback_to_stream(cuda_lib, *default_stream)?;
                 },
                 _ => return Err("Unsupported device".into()),
             }
