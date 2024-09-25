@@ -7,9 +7,13 @@ edition = "2021"
 candle-core = { git = "https://github.com/ro99/candle.git", version = "0.6.1", features = ["cuda"] }
 half = "2.4.1"
 io-uring = "0.6.4"
+libc = { version = "0.2.159", features = ["align"] }
 lru = "0.12.4"
 memmap2 = "0.9.5"
 safetensors = "0.4.5"
 serde_json = "1.0.128"
 thiserror = "1.0.63"
 tokio = { version = "1.40.0", features = ["full"] }
+
+[features]
+st_debug = []

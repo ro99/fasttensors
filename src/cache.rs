@@ -2,9 +2,10 @@ use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::hash::Hash;
+use std::time::{Instant, Duration};
 
 pub struct Cache<K, T> {
-    cache: Mutex<LruCache<K, Arc<T>>>,  //TODO: review the need of Mutex
+    cache: Mutex<LruCache<K, (Arc<T>, Instant)>>,
 }
 
 impl<K, T> Cache<K, T>
@@ -19,7 +20,7 @@ where
 
     pub fn get(&self, key: &K) -> Option<Arc<T>> {
         let mut cache = self.cache.lock().unwrap();
-        cache.get(key).cloned()
+        cache.get(key).map(|(value, _)| value.clone())
     }
 
     pub fn insert<V>(&self, key: K, value: V) 
@@ -28,12 +29,12 @@ where
     {
         let value = value.into();
         let mut cache = self.cache.lock().unwrap();
-        cache.put(key, value);
+        cache.put(key, (value, Instant::now()));
     }
 
     pub fn lru(&self) -> Option<(K, Arc<T>)> {
         let mut cache = self.cache.lock().unwrap();
-        cache.pop_lru().map(|(k, v)| (k, v.clone()))
+        cache.pop_lru().map(|(k, (v, _))| (k, v.clone()))
     }
 
     pub fn contains_key(&self, key: &K) -> bool {
@@ -43,11 +44,21 @@ where
 
     pub fn remove(&self, key: &K) -> Option<Arc<T>> {
         let mut cache = self.cache.lock().unwrap();
-        cache.pop(key)
+        cache.pop(key).map(|(v, _)| v)
     }
 
     pub fn clear(&self) {
         let mut cache = self.cache.lock().unwrap();
         cache.clear();
+    }
+
+    pub fn get_last_use(&self, key: &K) -> Option<Instant> {
+        let cache = self.cache.lock().unwrap();
+        cache.peek(key).map(|(_, timestamp)| *timestamp)
+    }
+
+    pub fn iter(&self) -> Vec<(K, Arc<T>)> {
+        let cache = self.cache.lock().unwrap();
+        cache.iter().map(|(k, (v, _))| (k.clone(), v.clone())).collect()
     }
 }

@@ -1,44 +1,35 @@
-use candle_core::cuda::cudarc::driver::sys as cudarc_sys;
-use candle_core::cuda::cudarc::driver::DevicePtr;
+use candle_core::cuda::cudarc::{driver::sys as cudarc_sys, driver::DevicePtr};
+use candle_core::{DType, Device, Storage, Tensor};
+use tokio::io::{SeekFrom, AsyncReadExt, AsyncSeekExt};
+use tokio::fs::{File, OpenOptions};
+use tokio::time::{sleep, Instant};
 
-use candle_core::DType;
-use candle_core::Device;
-use candle_core::Storage;
-use candle_core::Tensor;
-use std::io::SeekFrom;
-use std::os::unix::io::AsRawFd;
-use std::sync::atomic::AtomicPtr;
-use std::sync::{Arc, RwLock};
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncSeekExt;
-
-use std::io;
+use std::os::{unix::io::RawFd, raw::c_void, unix::io::AsRawFd};
+use std::sync::atomic::AtomicI32;
+use std::sync::{Arc, OnceLock, atomic::{AtomicUsize, Ordering, AtomicPtr}};
+use std::time::Duration;
+use std::{ffi::OsStr, path::Path, ptr::NonNull};
 use std::ops::Deref;
-use std::os::unix::fs::OpenOptionsExt;
-use std::{
-    ffi::OsStr,
-    os::{raw::c_void, unix::io::RawFd},
-    path::Path,
-    ptr::NonNull,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        OnceLock,
-    },
-};
-use tokio::fs::File;
 
-use crate::{
-    cache::Cache,
-    op::{allocate_pinned_memory, free_pinned_memory},
-};
+use crate::{cache::Cache, op::{allocate_pinned_memory, free_pinned_memory}};
 
-const Q_DEPTH: u32 = 8;
+#[cfg(target_os = "linux")]
+use libc::O_DIRECT;
+
+#[cfg(not(target_os = "linux"))]
+const O_DIRECT: i32 = 0;
+
+// Add this macro for debug logging
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        println!($($arg)*);
+    }
+}
+
 const MAX_PAGES: usize = 4;
 const MAX_BLOCK_SIZE: usize = 128 * 1024; // 128 KB
 const PAGE_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 const PINNED_MEMORY: usize = MAX_PAGES * PAGE_SIZE; // 64 MB
-const O_DIRECT: i32 = 0x4000; // Linux
 
 static CUDA_LIB: OnceLock<cudarc_sys::Lib> = OnceLock::new();
 pub fn get_cuda_lib() -> &'static cudarc_sys::Lib {
@@ -53,25 +44,25 @@ pub fn get_cuda_lib() -> &'static cudarc_sys::Lib {
 struct CudaError(cudarc_sys::CUresult);
 
 pub struct GpuOpCell {
-    count: AtomicUsize,
+    count: AtomicI32,
 }
 
 impl GpuOpCell {
     pub fn new() -> Self {
         GpuOpCell {
-            count: AtomicUsize::new(0),
+            count: AtomicI32::new(0),
         }
     }
 
-    pub fn increment(&self) -> usize {
+    pub fn increment(&self) -> i32 {
         self.count.fetch_add(1, Ordering::SeqCst)
     }
 
-    pub fn decrement(&self) -> usize {
+    pub fn decrement(&self) -> i32 {
         self.count.fetch_sub(1, Ordering::SeqCst)
     }
 
-    pub fn get(&self) -> usize {
+    pub fn get(&self) -> i32 {
         self.count.load(Ordering::SeqCst)
     }
 
@@ -120,25 +111,6 @@ impl CudaGpuOpCell {
     }
 }
 
-/*// This guard can be used to automatically decrement the counter when it goes out of scope
-pub struct GpuOpGuard<'a> {
-    cell: &'a CudaGpuOpCell,
-}
-
-impl<'a> GpuOpGuard<'a> {
-    pub fn new(cell: &'a CudaGpuOpCell) -> Self {
-        cell.increment();
-        GpuOpGuard { cell }
-    }
-}
-
-impl<'a> Drop for GpuOpGuard<'a> {
-    fn drop(&mut self) {
-        self.cell.cell.decrement();
-    }
-} */
-// TODO: add a guard for the pinned memory
-
 #[derive(Clone, Copy, Eq, Hash)]
 pub struct FileRange {
     file_descriptor: RawFd,
@@ -181,8 +153,6 @@ impl PartialOrd for FileRange {
 
 pub struct Page {
     gpu_op_cell: CudaGpuOpCell,
-    file_range: FileRange,
-    access: isize,
     ptr: NonNull<u8>,
 }
 
@@ -190,8 +160,6 @@ impl Page {
     pub fn new(ptr: NonNull<u8>) -> Self {
         Page {
             gpu_op_cell: CudaGpuOpCell::new(),
-            file_range: FileRange::new(-1, 0, 0),
-            access: -1,
             ptr,
         }
     }
@@ -206,8 +174,7 @@ impl Page {
 unsafe impl Send for Page {}
 unsafe impl Sync for Page {}
 
-pub struct PinnedMemory {
-}
+pub struct PinnedMemory {}
 
 // Just to make sure we keep the pinned memory allocated
 static PINNED_BUFFER: OnceLock<AtomicPtr<u8>> = OnceLock::new();
@@ -220,71 +187,41 @@ impl PinnedMemory {
     pub fn allocate() -> Result<(), cudarc_sys::CUresult> {
         if PINNED_BUFFER.get().is_none() {
             let size = PINNED_MEMORY;
-            let alignment = MAX_BLOCK_SIZE;
+            let alignment = align_of::<usize>().max(MAX_BLOCK_SIZE);
             let total_size = size + alignment;
 
             let pinned_buffer = allocate_pinned_memory(total_size)?;
-            PINNED_BUFFER.set(pinned_buffer.into()).expect("Failed to set PINNED_BUFFER");
+            PINNED_BUFFER
+                .set(AtomicPtr::new(pinned_buffer))
+                .expect("Failed to set PINNED_BUFFER");
 
-            let aligned = (pinned_buffer as usize + alignment - 1) & !(alignment - 1);
-            ALIGNED_BUFFER.set((aligned as *mut u8).into()).expect("Failed to set ALIGNED_BUFFER");
+            let aligned_offset = pinned_buffer.align_offset(alignment);
+            let aligned = unsafe { pinned_buffer.add(aligned_offset) };
+            ALIGNED_BUFFER
+                .set(AtomicPtr::new(aligned))
+                .expect("Failed to set ALIGNED_BUFFER");
 
             let pages = Cache::new(MAX_PAGES);
 
             for i in 0..MAX_PAGES {
                 let page_ptr = unsafe { (aligned as *mut u8).add(i * PAGE_SIZE) };
                 let page = Page::new(NonNull::new(page_ptr).unwrap());
-                pages.insert(FileRange::new(-1 * i as i32, 0, 0), page);
+                pages.insert(FileRange::new(-1, 0, 0), page);
             }
-            PAGES.set(pages).map_err(|_| cudarc_sys::CUresult::CUDA_ERROR_ILLEGAL_STATE)?;
+            PAGES
+                .set(pages)
+                .map_err(|_| cudarc_sys::CUresult::CUDA_ERROR_ILLEGAL_STATE)?;
         }
         Ok(())
-    }
-
-    pub async fn read_page(
-        file: &mut File,
-        file_range: FileRange,
-        filesize: usize,
-    ) -> Result<Arc<Page>, Box<dyn std::error::Error>> {
-        if let Some(pages) = PAGES.get() {
-            let (_, old_page) = pages.lru().unwrap();
-
-            let read_len = std::cmp::min(file_range.end - file_range.start, filesize - file_range.start);
-
-            file.seek(SeekFrom::Start(file_range.start as u64)).await?;
-            let bytes_read = file.read(unsafe { std::slice::from_raw_parts_mut(old_page.ptr(), read_len) }).await?;
-            if bytes_read == 0 {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!("Reached EOF after reading {} of {} bytes", bytes_read, read_len)
-                )));
-            }
-            PAGES.get().unwrap().insert(file_range, old_page.clone());
-            return Ok(old_page);
-        }
-        Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Page not found")))
-    }
-
-    pub async fn get_cache_page(
-        file: &mut File,
-        filesize: usize,
-        start_offset: usize,
-        end_offset: usize,
-    ) -> Result<Arc<Page>, Box<dyn std::error::Error>> {
-        let file_descriptor = file.as_raw_fd();
-        let file_range = FileRange::new(file_descriptor, start_offset, end_offset);
-
-        if let Some(page) = PAGES.get().unwrap().get(&file_range) {
-            return Ok(page);
-        }
-        let page = PinnedMemory::read_page(file, file_range, filesize).await?;
-        Ok(page)
     }
 }
 
 impl Drop for PinnedMemory {
     fn drop(&mut self) {
-        let pinned_buffer = PINNED_BUFFER.get().unwrap().load(std::sync::atomic::Ordering::SeqCst);
+        let pinned_buffer = PINNED_BUFFER
+            .get()
+            .unwrap()
+            .load(std::sync::atomic::Ordering::SeqCst);
         if let Err(e) = free_pinned_memory(pinned_buffer) {
             eprintln!("Error freeing pinned memory: {:?}", e);
         }
@@ -292,21 +229,28 @@ impl Drop for PinnedMemory {
 }
 
 pub struct SafeTensorFile {
-    file: File,
+    file_descriptor: File,
     filesize: u64,
 }
 
+// Ensure SafeTensorFile is Send + Sync
+unsafe impl Send for SafeTensorFile {}
+unsafe impl Sync for SafeTensorFile {}
+
 impl SafeTensorFile {
-    pub async fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let file = OpenOptions::new()
+    pub async fn new<P: AsRef<Path>>(path: P) -> tokio::io::Result<Self> {
+        let file_descriptor = OpenOptions::new()
             .read(true)
             .custom_flags(O_DIRECT)
             .open(path)
             .await?;
-        let metadata = file.metadata().await?;
+        let metadata = file_descriptor.metadata().await?;
         let filesize = metadata.len();
 
-        Ok(Self { file, filesize })
+        Ok(Self {
+            file_descriptor,
+            filesize,
+        })
     }
 
     pub async fn load(
@@ -316,6 +260,9 @@ impl SafeTensorFile {
         offset: usize,
         length: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        debug_log!("-- load tensor");
+        debug_log!("offset: {}, length: {}", offset, length);
+
         let cuda_lib = get_cuda_lib();
 
         // Allocate pinned memory
@@ -335,22 +282,37 @@ impl SafeTensorFile {
         };
 
         while tensor_offset < length {
-            
-            file_a = file_b;
-            file_b += PAGE_SIZE;
 
-            let page = PinnedMemory::get_cache_page(&mut self.file, self.filesize as usize, file_a, file_b).await?;
+
+            file_a = file_b;
+            file_b = file_a + PAGE_SIZE;
+
+            debug_log!("-- get cache page");
+            debug_log!("file_descriptor: {}, file_a: {}, file_b: {}", self.file_descriptor.as_raw_fd(), file_a, file_b);
+            debug_log!("block_size: {}, filesize: {}", MAX_BLOCK_SIZE, self.filesize);
+
+            let page = get_cache_page(&mut self.file_descriptor, self.filesize as usize, file_a, file_b).await?;
 
             let left = if file_a > offset { 0 } else { offset - file_a };
-            let right = if (offset + length - file_a) > PAGE_SIZE { PAGE_SIZE } else { offset + length - file_a };
+            let right = if file_a > offset + length { 0 } else {
+                let x = offset + length - file_a;
+                if x > PAGE_SIZE { PAGE_SIZE } else { x }
+            };
+
             let copy_len = right - left;
+
+            debug_log!("-- copy chunk");
+            debug_log!("left: {}, right: {}, copy_len: {}", left, right, copy_len);
+            debug_log!("tensor_offset: {}", tensor_offset);
 
             let src = unsafe { page.ptr().add(left) };
             let dst = unsafe { target.add(tensor_offset) };
 
             match device {
                 Device::Cuda(_) => unsafe {
+                    debug_log!("Performing CUDA memcpy: src={:?}, dst={:?}, copy_len={}", src, dst, copy_len);
                     cuda_lib.cuMemcpyAsync(dst as u64, src as u64, copy_len, default_stream.stream).result()?;
+
                     page.gpu_op_cell.increment();
                     page.gpu_op_cell.decrement_callback(cuda_lib, default_stream.stream)?;
                 },
@@ -358,8 +320,99 @@ impl SafeTensorFile {
             }
             tensor_offset += copy_len;
         }
+        debug_log!("SafeTensorFile::load completed");
         Ok(())
     }
+}
+
+
+async fn read_page(
+    file: &mut File,
+    file_range: FileRange,
+    filesize: usize,
+) -> Result<Arc<Page>, Box<dyn std::error::Error>> {
+    if let Some(pages) = PAGES.get() {
+        debug_log!("-- read page");
+        debug_log!("file_descriptor: {}, file_a: {}, file_b: {}", file_range.file_descriptor, file_range.start, file_range.end);
+        const MAX_WAIT_TIME: Duration = Duration::from_secs(5);
+        const WAIT_INTERVAL: Duration = Duration::from_millis(10);
+        let start_time = Instant::now();
+
+        loop {
+            // Find all pages that are not in use
+            let available_pages: Vec<_> = pages.iter()
+                .into_iter()  // Convert Vec back to an iterator
+                .filter(|(_, page)| !page.is_in_use())
+                .collect();
+
+            if !available_pages.is_empty() {
+                // Find the least recently used page among the available ones
+                let (evict_key, evict_page) = available_pages
+                    .into_iter()
+                    .min_by_key(|(k, _)| pages.get_last_use(k))
+                    .unwrap();
+
+                // Remove the page from its current position
+                pages.remove(&evict_key);
+
+                let read_len = std::cmp::min(
+                    PAGE_SIZE,
+                    filesize - file_range.start,
+                );
+
+                debug_log!("read_len: {}", read_len);
+
+                let mut buffer = unsafe { std::slice::from_raw_parts_mut(evict_page.ptr(), read_len) };
+                file.seek(SeekFrom::Start(file_range.start as u64)).await?;
+                let bytes_read = file.read_exact(&mut buffer).await?;
+
+                debug_log!("read_len: {}", read_len);
+                debug_log!("bytes_read: {}", bytes_read);
+
+                if bytes_read == 0 {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "Reached EOF after reading {} of {} bytes",
+                            bytes_read, read_len
+                        ),
+                    )));
+                }
+
+                pages.insert(file_range, evict_page.clone());
+                return Ok(evict_page);
+            }
+
+            if start_time.elapsed() > MAX_WAIT_TIME {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Timed out waiting for an available page",
+                )));
+            }
+
+            sleep(WAIT_INTERVAL).await;
+        }
+    }
+    Err(Box::new(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "Page not found",
+    )))
+}
+
+async fn get_cache_page(
+    file_descriptor: &mut File,
+    filesize: usize,
+    start_offset: usize,
+    end_offset: usize,
+) -> Result<Arc<Page>, Box<dyn std::error::Error>> {
+    let file_descriptor_fd = file_descriptor.as_raw_fd();
+    let file_range = FileRange::new(file_descriptor_fd, start_offset, end_offset);
+
+    if let Some(page) = PAGES.get().unwrap().get(&file_range) {
+        return Ok(page);
+    }
+    let page = read_page(file_descriptor, file_range, filesize).await?;
+    Ok(page)
 }
 
 fn get_raw_tensor_ptr(tensor: &mut Tensor) -> Result<*mut u8, Box<dyn std::error::Error>> {
