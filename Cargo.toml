@@ -14,6 +14,3 @@ safetensors = "0.4.5"
 serde_json = "1.0.128"
 thiserror = "1.0.63"
 tokio = { version = "1.40.0", features = ["full"] }
-
-[features]
-st_debug = []

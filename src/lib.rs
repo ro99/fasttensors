@@ -149,12 +149,8 @@ impl FastTensorFile {
             file_handle: Mutex::new(file),
         });
 
-        // Add the new FastTensorFile to the cache
-        STFILE_CACHE
-            .get()
-            .unwrap()
-            .insert(filename_str, stfile.clone());
 
+        STFILE_CACHE.get().unwrap().insert(filename_str.clone(), stfile.clone());
         Ok(stfile)
     }
 
@@ -275,7 +271,9 @@ impl FastTensorFile {
                     FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string()))
                 });
         }
-        let context = sf::load(&self.filename, device).map_err(|_| {
+
+        let context = sf::load(&self.filename, device).map_err(|e| {
+            println!("Error loading context: {}", e);
             FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(key.to_string()))
         })?;
 
@@ -317,6 +315,8 @@ impl FastTensorFile {
             .await.map_err(|e| {
                 FastTensorsError::SafeTensors(SafeTensorError::TensorNotFound(e.to_string()))
             })?;
+
+        let _ = device.synchronize(); //TODO review this
         Ok(tensor)
     }
 }
@@ -334,16 +334,17 @@ pub fn convert_dtype(dt: &str) -> Result<DType, FastTensorsError> {
 
 pub fn cleanup() {
     if let Some(cache) = STFILE_CACHE.get() {
-        // Remove all FastTensorFile instances from the cache
         cache.clear();
     }
-    // Clear other caches as well
     if let Some(cache) = TENSOR_CACHE.get() {
         cache.clear();
     }
     if let Some(cache) = CONTEXT_CACHE.get() {
         cache.clear();
     }
+    let _ = mem::free_pinned_memory().map_err(|e| {
+        eprintln!("Error freeing pinned memory: {:?}", e);
+    });
 }
 
 impl Drop for FastTensorFile {
@@ -365,21 +366,21 @@ mod tests {
         init_caches();
 
         // Path to your safetensors file
-        let model_path = "/home/rodrigo/AI/Models/Exllama/Cohere-Aya23-35B/Cohere-aya-23-35B-8.0bpw-h8-exl2/output-00001-of-00005.safetensors";
+        let model_path = "/home/rodrigo/AI/Models/Exllama/Cohere-Aya23-35B/Cohere-aya-23-35B-8.0bpw-h8-exl2/output-00002-of-00005.safetensors";
 
         // Create a FastTensorFile instance in fast mode
         let fast_tensor_file = FastTensorFile::new(model_path, true, None).await?;
 
         // Get the first key
         //let first_key = fast_tensor_file.get_keys().first().unwrap().clone();
-        let first_key = "model.layers.0.mlp.up_proj.q_weight".to_string();
+        let first_key = "model.layers.10.mlp.down_proj.q_invperm".to_string();
 
         // Get the tensor for the first key using fast mode
         let device = Device::cuda_if_available(0)?;
         let tensor = fast_tensor_file.get_tensor(&first_key, &device, false, None).await?;
 
         // Check if the first value is 4643
-        let first_value = tensor.to_vec2::<i32>()?[0][0];
+        let first_value = tensor.to_vec1::<i32>()?[0];
         //assert_eq!(first_value, 1618246796, "The first value should be 1618246796");
 
         // Cleanup
